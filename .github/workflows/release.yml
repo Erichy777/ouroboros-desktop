@@ -59,9 +59,13 @@ jobs:
         run: |
           VERSION=$(cat VERSION | tr -d '[:space:]')
           python -m PyInstaller Ouroboros.spec --clean --noconfirm
+          sleep 3
           hdiutil create -volname Ouroboros \
             -srcfolder dist/Ouroboros.app -ov -format UDZO \
-            "dist/Ouroboros-${VERSION}-macos.dmg"
+            "dist/Ouroboros-${VERSION}-macos.dmg" \
+          || { sleep 10; hdiutil create -volname Ouroboros \
+            -srcfolder dist/Ouroboros.app -ov -format UDZO \
+            "dist/Ouroboros-${VERSION}-macos.dmg"; }
 
       - name: Build (Linux)
         if: runner.os == 'Linux'
