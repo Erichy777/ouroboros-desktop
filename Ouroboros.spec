@@ -27,6 +27,19 @@ else:
     _icon = None
     _console = False
 
+# ---------------------------------------------------------------------------
+# Strip dev-only files from python-standalone before bundling.
+# python-build-standalone ships symlinks (lib/pkgconfig, etc.) that break
+# PyInstaller's BUNDLE step on macOS.
+# ---------------------------------------------------------------------------
+import shutil as _shutil
+for _sub in ('lib/pkgconfig', 'share/pkgconfig', 'include'):
+    _p = os.path.join('python-standalone', _sub)
+    if os.path.islink(_p):
+        os.remove(_p)
+    elif os.path.isdir(_p):
+        _shutil.rmtree(_p)
+
 a = Analysis(
     ['launcher.py'],
     pathex=[],
