@@ -19,7 +19,21 @@ _SKIP_EXT = {
     ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar", ".mp3", ".mp4", ".mov",
     ".avi", ".wav", ".ogg", ".opus", ".woff", ".woff2", ".ttf", ".otf",
     ".class", ".so", ".dylib", ".bin",
+    # sensitive credential/key files
+    ".env", ".pem", ".key", ".p12", ".pfx", ".crt", ".cer", ".der",
+    # database files
+    ".sqlite", ".db", ".sqlite3",
+    # large binary/data files
+    ".csv", ".tsv", ".parquet", ".avro", ".h5", ".pt", ".ckpt", ".safetensors",
 }
+
+_SKIP_FILENAMES = {
+    ".env", ".env.local", ".env.production",
+    "secrets.json", "credentials.json", "credentials.yml",
+    ".netrc", ".npmrc", ".pypirc",
+}
+
+_MAX_FILE_BYTES = 1_048_576  # 1 MB per-file cap
 
 
 # ---------------------------------------------------------------------------
@@ -169,11 +183,69 @@ def collect_sections(
 
     _walk(repo_dir, "repo",
           {"__pycache__", ".git", ".pytest_cache", ".mypy_cache", "node_modules", ".venv"})
-    _walk(drive_root, "drive", {"archive", "locks", "downloads", "screenshots"})
+    # Only scan memory/ — identity, scratchpad, knowledge base (not logs/state/artifacts)
+    _walk(drive_root / "memory", "drive/memory", set())
 
     stats = {"files": len(sections), "chars": total_chars,
              "truncated": truncated, "dropped": dropped}
     return sections, stats
+
+
+def collect_full_codebase(
+    repo_dir: pathlib.Path,
+    drive_root: pathlib.Path,
+) -> Tuple[str, Dict[str, Any]]:
+    """Collect ALL text files without truncation, formatted for single-context review.
+
+    Returns (full_text, stats) where stats has keys: files, tokens.
+    Includes repo files and drive memory files (identity.md, scratchpad.md, knowledge base).
+    Skips drive logs (*.jsonl).
+    """
+    parts: List[str] = []
+    file_count = 0
+
+    def _walk(root: pathlib.Path, prefix: str, skip_dirs: set, skip_ext_extra: set = frozenset()) -> None:
+        nonlocal file_count
+        try:
+            root_resolved = root.resolve()
+            if not root_resolved.exists():
+                return
+        except Exception:
+            return
+
+        for dirpath, dirnames, filenames in os.walk(str(root_resolved)):
+            dirnames[:] = [d for d in sorted(dirnames) if d not in skip_dirs]
+            for fn in sorted(filenames):
+                try:
+                    p = pathlib.Path(dirpath) / fn
+                    if not p.is_file() or p.is_symlink():
+                        continue
+                    if p.suffix.lower() in _SKIP_EXT:
+                        continue
+                    if p.suffix.lower() in skip_ext_extra:
+                        continue
+                    if fn in _SKIP_FILENAMES:
+                        continue
+                    if p.stat().st_size > _MAX_FILE_BYTES:
+                        continue
+                    content = p.read_text(encoding="utf-8", errors="replace")
+                    if not content.strip():
+                        continue
+                    rel = p.relative_to(root_resolved).as_posix()
+                    parts.append(f"## FILE: {prefix}/{rel}\n{content}\n")
+                    file_count += 1
+                except Exception:
+                    continue
+
+    _walk(repo_dir, "repo",
+          {"__pycache__", ".git", ".pytest_cache", ".mypy_cache", "node_modules", ".venv", ".idea", ".vscode"})
+    # Only scan memory/ — identity, scratchpad, knowledge base (not logs/state/artifacts)
+    _walk(drive_root / "memory", "drive/memory", set(), skip_ext_extra={".jsonl"})
+
+    full_text = "\n".join(parts)
+    token_estimate = estimate_tokens(full_text)
+    stats = {"files": file_count, "tokens": token_estimate}
+    return full_text, stats
 
 
 def chunk_sections(sections: List[Tuple[str, str]], chunk_token_cap: int = 70_000) -> List[str]:

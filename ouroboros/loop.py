@@ -11,8 +11,8 @@ import json
 import os
 import pathlib
 import queue
-import threading
 import time
+import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -22,90 +22,20 @@ from ouroboros.llm import LLMClient, normalize_reasoning_effort, add_usage
 from ouroboros.tools.registry import ToolRegistry
 from ouroboros.context import compact_tool_history, compact_tool_history_llm
 from ouroboros.utils import utc_now_iso, append_jsonl, truncate_for_log, sanitize_tool_args_for_log, sanitize_tool_result_for_log, estimate_tokens
+from ouroboros.pricing import get_pricing, estimate_cost, infer_api_key_type, infer_model_category, emit_llm_usage_event
 
 log = logging.getLogger(__name__)
 
-# Pricing from OpenRouter API (2026-02-17). Update periodically via /api/v1/models.
-_MODEL_PRICING_STATIC = {
-    "anthropic/claude-opus-4.6": (5.0, 0.5, 25.0),
-    "anthropic/claude-opus-4": (15.0, 1.5, 75.0),
-    "anthropic/claude-sonnet-4": (3.0, 0.30, 15.0),
-    "anthropic/claude-sonnet-4.6": (3.0, 0.30, 15.0),
-    "anthropic/claude-sonnet-4.5": (3.0, 0.30, 15.0),
-    "openai/o3": (2.0, 0.50, 8.0),
-    "openai/o3-pro": (20.0, 1.0, 80.0),
-    "openai/o4-mini": (1.10, 0.275, 4.40),
-    "openai/gpt-4.1": (2.0, 0.50, 8.0),
-    "openai/gpt-5.2": (1.75, 0.175, 14.0),
-    "openai/gpt-5.2-codex": (1.75, 0.175, 14.0),
-    "google/gemini-2.5-pro-preview": (1.25, 0.125, 10.0),
-    "google/gemini-3.1-pro-preview": (2.0, 0.20, 12.0),
-    "google/gemini-3-pro-preview": (2.0, 0.20, 12.0),
-    "google/gemini-3-flash-preview": (0.15, 0.015, 0.60),
-    "x-ai/grok-3-mini": (0.30, 0.03, 0.50),
-    "qwen/qwen3.5-plus-02-15": (0.40, 0.04, 2.40),
-}
 
-_pricing_fetched = False
-_cached_pricing = None
-_pricing_lock = threading.Lock()
-
-def _get_pricing() -> Dict[str, Tuple[float, float, float]]:
-    """
-    Lazy-load pricing. On first call, attempts to fetch from OpenRouter API.
-    Falls back to static pricing if fetch fails.
-    Thread-safe via module-level lock.
-    """
-    global _pricing_fetched, _cached_pricing
-
-    # Single locked path: avoids races between flag/cache updates.
-    with _pricing_lock:
-        if _cached_pricing is None:
-            _cached_pricing = dict(_MODEL_PRICING_STATIC)
-        if _pricing_fetched:
-            return _cached_pricing
-
+def _get_tool_timeout(tools: ToolRegistry, tool_name: str) -> int:
+    """Get timeout for a tool call. Env override takes precedence over per-tool default."""
+    env_val = os.environ.get("OUROBOROS_TOOL_TIMEOUT_SEC")
+    if env_val:
         try:
-            from ouroboros.llm import fetch_openrouter_pricing
-            _live = fetch_openrouter_pricing()
-            if _live and len(_live) > 5:
-                _cached_pricing.update(_live)
-            _pricing_fetched = True
-        except Exception as e:
-            import logging as _log
-            _log.getLogger(__name__).warning("Failed to sync pricing from OpenRouter: %s", e)
-            # Keep flag false so we retry on next call.
-            _pricing_fetched = False
-
-        return _cached_pricing
-
-def _estimate_cost(model: str, prompt_tokens: int, completion_tokens: int,
-                   cached_tokens: int = 0, cache_write_tokens: int = 0) -> float:
-    """Estimate cost from token counts using known pricing. Returns 0 if model unknown."""
-    model_pricing = _get_pricing()
-    # Try exact match first
-    pricing = model_pricing.get(model)
-    if not pricing:
-        # Try longest prefix match
-        best_match = None
-        best_length = 0
-        for key, val in model_pricing.items():
-            if model and model.startswith(key):
-                if len(key) > best_length:
-                    best_match = val
-                    best_length = len(key)
-        pricing = best_match
-    if not pricing:
-        return 0.0
-    input_price, cached_price, output_price = pricing
-    # Non-cached input tokens = prompt_tokens - cached_tokens
-    regular_input = max(0, prompt_tokens - cached_tokens)
-    cost = (
-        regular_input * input_price / 1_000_000
-        + cached_tokens * cached_price / 1_000_000
-        + completion_tokens * output_price / 1_000_000
-    )
-    return round(cost, 6)
+            return int(env_val)
+        except ValueError:
+            pass
+    return tools.get_timeout(tool_name)
 
 READ_ONLY_PARALLEL_TOOLS = frozenset({
     "repo_read", "repo_list",
@@ -117,16 +47,26 @@ READ_ONLY_PARALLEL_TOOLS = frozenset({
 STATEFUL_BROWSER_TOOLS = frozenset({"browse_page", "browser_action"})
 
 
-def _truncate_tool_result(result: Any) -> str:
-    """
-    Hard-cap tool result string to 15000 characters.
-    If truncated, append a note with the original length.
-    """
+# Per-tool result size limits (chars).  File tools get larger caps.
+_TOOL_RESULT_LIMITS: Dict[str, int] = {
+    "repo_read": 80_000,
+    "data_read": 80_000,
+    "run_shell": 40_000,
+}
+_DEFAULT_TOOL_RESULT_LIMIT = 15_000
+
+
+def _truncate_tool_result(result: Any, tool_name: str = "") -> str:
+    """Cap tool result to a per-tool char limit (repo_read/data_read=80k, run_shell=40k, default=15k)."""
+    # Handle image results - extract text only, image goes in separate user message
+    if isinstance(result, dict) and "__image__" in result:
+        return str(result.get("text", "Screenshot captured."))
+
+    limit = _TOOL_RESULT_LIMITS.get(tool_name, _DEFAULT_TOOL_RESULT_LIMIT)
     result_str = str(result)
-    if len(result_str) <= 15000:
+    if len(result_str) <= limit:
         return result_str
-    original_len = len(result_str)
-    return result_str[:15000] + f"\n... (truncated from {original_len} chars)"
+    return result_str[:limit] + f"\n... (truncated from {len(result_str)} chars, limit={limit})"
 
 
 def _execute_single_tool(
@@ -300,7 +240,7 @@ def _execute_with_timeout(
         future = stateful_executor.submit(_execute_single_tool, tools, tc, drive_logs, task_id)
         try:
             return future.result(timeout=timeout_sec)
-        except TimeoutError:
+        except (TimeoutError, concurrent.futures.TimeoutError):
             stateful_executor.reset()
             reset_msg = "Browser state has been reset. "
             return _make_timeout_result(
@@ -314,7 +254,7 @@ def _execute_with_timeout(
             future = executor.submit(_execute_single_tool, tools, tc, drive_logs, task_id)
             try:
                 return future.result(timeout=timeout_sec)
-            except TimeoutError:
+            except (TimeoutError, concurrent.futures.TimeoutError):
                 return _make_timeout_result(
                     fn_name, tool_call_id, is_code_tool, tc, drive_logs,
                     timeout_sec, task_id, reset_msg=""
@@ -350,7 +290,7 @@ def _handle_tool_calls(
     if not can_parallel:
         results = [
             _execute_with_timeout(tools, tc, drive_logs,
-                                  tools.get_timeout(tc["function"]["name"]), task_id,
+                                  _get_tool_timeout(tools, tc["function"]["name"]), task_id,
                                   stateful_executor)
             for tc in tool_calls
         ]
@@ -361,7 +301,7 @@ def _handle_tool_calls(
             future_to_index = {
                 executor.submit(
                     _execute_with_timeout, tools, tc, drive_logs,
-                    tools.get_timeout(tc["function"]["name"]), task_id,
+                    _get_tool_timeout(tools, tc["function"]["name"]), task_id,
                     stateful_executor,
                 ): idx
                 for idx, tc in enumerate(tool_calls)
@@ -369,7 +309,20 @@ def _handle_tool_calls(
             results = [None] * len(tool_calls)
             for future in as_completed(future_to_index):
                 idx = future_to_index[future]
-                results[idx] = future.result()
+                try:
+                    results[idx] = future.result()
+                except Exception as exc:
+                    # Safety net: if _execute_with_timeout itself raised, wrap as error result
+                    tc = tool_calls[idx]
+                    fn_name = tc.get("function", {}).get("name", "unknown")
+                    results[idx] = {
+                        "tool_call_id": tc.get("id", ""),
+                        "fn_name": fn_name,
+                        "result": f"⚠️ TOOL_ERROR: Unexpected error: {exc}",
+                        "is_error": True,
+                        "args_for_log": {},
+                        "is_code_tool": fn_name in tools.CODE_TOOLS,
+                    }
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
 
@@ -406,6 +359,7 @@ def _check_budget_limits(
     event_queue: Optional[queue.Queue],
     llm_trace: Dict[str, Any],
     task_type: str = "task",
+    use_local: bool = False,
 ) -> Optional[Tuple[str, Dict[str, Any], Dict[str, Any]]]:
     """
     Check budget limits and handle budget overrun.
@@ -418,7 +372,14 @@ def _check_budget_limits(
         return None
 
     task_cost = accumulated_usage.get("cost", 0)
-    
+
+    # --- Per-task cost soft reminder ---
+    per_task_reminder = float(os.environ.get("OUROBOROS_PER_TASK_COST_USD", "5.0"))
+    if task_cost >= per_task_reminder and round_idx % 10 == 0:
+        # Soft reminder only — no hard stop. Agent decides whether to continue.
+        messages.append({"role": "user", "content": f"[COST NOTE] This task has spent ${task_cost:.2f} so far. Continue if the work justifies it."})
+
+    # --- Global budget guard ---
     # Absolute budget exhaustion
     if budget_remaining_usd <= 0:
         finish_reason = f"🚫 Task rejected. Total budget exhausted. Please increase TOTAL_BUDGET in settings."
@@ -433,7 +394,8 @@ def _check_budget_limits(
         try:
             final_msg, final_cost = _call_llm_with_retry(
                 llm, messages, active_model, None, active_effort,
-                max_retries, drive_logs, task_id, round_idx, event_queue, accumulated_usage, task_type
+                max_retries, drive_logs, task_id, round_idx, event_queue, accumulated_usage, task_type,
+                use_local=use_local,
             )
             if final_msg:
                 return (final_msg.get("content") or finish_reason), accumulated_usage, llm_trace
@@ -761,7 +723,8 @@ def run_llm_loop(
             budget_result = _check_budget_limits(
                 budget_remaining_usd, accumulated_usage, round_idx, messages,
                 llm, active_model, active_effort, max_retries, drive_logs,
-                task_id, event_queue, llm_trace, task_type
+                task_id, event_queue, llm_trace, task_type,
+                use_local=active_use_local,
             )
             if budget_result is not None:
                 return budget_result
@@ -780,71 +743,6 @@ def run_llm_loop(
                 cleanup_task_mailbox(drive_root, task_id)
             except Exception:
                 log.debug("Failed to cleanup task mailbox", exc_info=True)
-
-
-def _infer_api_key_type(model: str) -> str:
-    """Infer which API key is used based on model name."""
-    if model.startswith(("anthropic/", "google/", "openai/", "x-ai/", "qwen/")):
-        return "openrouter"
-    if "claude" in model.lower():
-        return "anthropic"
-    return "openrouter"
-
-
-def _infer_model_category(model: str) -> str:
-    """Infer model category by comparing against configured model env vars."""
-    configured = {
-        "main": os.environ.get("OUROBOROS_MODEL", ""),
-        "code": os.environ.get("OUROBOROS_MODEL_CODE", ""),
-        "light": os.environ.get("OUROBOROS_MODEL_LIGHT", ""),
-        "fallback": os.environ.get("OUROBOROS_MODEL_FALLBACK", ""),
-    }
-    for cat, val in configured.items():
-        if val and model == val:
-            return cat
-    return "other"
-
-
-def _emit_llm_usage_event(
-    event_queue: Optional[queue.Queue],
-    task_id: str,
-    model: str,
-    usage: Dict[str, Any],
-    cost: float,
-    category: str = "task",
-) -> None:
-    """
-    Emit llm_usage event to the event queue.
-
-    Args:
-        event_queue: Queue to emit events to (may be None)
-        task_id: Task ID for the event
-        model: Model name used for the LLM call
-        usage: Usage dict from LLM response
-        cost: Calculated cost for this call
-        category: Budget category (task, evolution, consciousness, review, summarize, other)
-    """
-    if not event_queue:
-        return
-    try:
-        event_queue.put_nowait({
-            "type": "llm_usage",
-            "ts": utc_now_iso(),
-            "task_id": task_id,
-            "model": model,
-            "api_key_type": _infer_api_key_type(model),
-            "model_category": _infer_model_category(model),
-            "prompt_tokens": int(usage.get("prompt_tokens") or 0),
-            "completion_tokens": int(usage.get("completion_tokens") or 0),
-            "cached_tokens": int(usage.get("cached_tokens") or 0),
-            "cache_write_tokens": int(usage.get("cache_write_tokens") or 0),
-            "cost": cost,
-            "cost_estimated": not bool(usage.get("cost")),
-            "usage": usage,
-            "category": category,
-        })
-    except Exception:
-        log.debug("Failed to put llm_usage event to queue", exc_info=True)
 
 
 def _call_llm_with_retry(
@@ -885,7 +783,7 @@ def _call_llm_with_retry(
             # Calculate cost and emit event for EVERY attempt (including retries)
             cost = float(usage.get("cost") or 0)
             if not cost:
-                cost = _estimate_cost(
+                cost = estimate_cost(
                     model,
                     int(usage.get("prompt_tokens") or 0),
                     int(usage.get("completion_tokens") or 0),
@@ -895,7 +793,7 @@ def _call_llm_with_retry(
 
             # Emit real-time usage event with category based on task_type
             category = task_type if task_type in ("evolution", "consciousness", "review", "summarize") else "task"
-            _emit_llm_usage_event(event_queue, task_id, model, usage, cost, category)
+            emit_llm_usage_event(event_queue, task_id, model, usage, cost, category)
 
             # Empty response = retry-worthy (model sometimes returns empty content with no tool_calls)
             tool_calls = msg.get("tool_calls") or []
@@ -980,7 +878,7 @@ def _process_tool_results(
             error_count += 1
 
         # Truncate tool result before appending to messages
-        truncated_result = _truncate_tool_result(exec_result["result"])
+        truncated_result = _truncate_tool_result(exec_result["result"], tool_name=fn_name)
 
         # Append tool result message
         messages.append({
@@ -988,6 +886,21 @@ def _process_tool_results(
             "tool_call_id": exec_result["tool_call_id"],
             "content": truncated_result
         })
+
+        # If tool returned an image, inject it as a user message (OpenAI-compat
+        # format doesn't support images in tool results, but does in user msgs)
+        raw_result = exec_result["result"]
+        if isinstance(raw_result, dict) and "__image__" in raw_result:
+            img = raw_result["__image__"]
+            b64_data = img["base64"]
+            mime = img.get("mime", "image/png")
+            messages.append({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "[Screenshot from tool call]"},
+                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64_data}"}}
+                ]
+            })
 
         # Append to LLM trace
         llm_trace["tool_calls"].append({

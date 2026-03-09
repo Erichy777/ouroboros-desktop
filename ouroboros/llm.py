@@ -122,6 +122,7 @@ class LLMClient:
             self._client = OpenAI(
                 base_url=self._base_url,
                 api_key=self._api_key,
+                max_retries=0,
                 default_headers={
                     "HTTP-Referer": "https://ouroboros.local/",
                     "X-Title": "Ouroboros",
@@ -136,6 +137,7 @@ class LLMClient:
             self._local_client = OpenAI(
                 base_url=f"http://127.0.0.1:{port}/v1",
                 api_key="local",
+                max_retries=0,
             )
             self._local_port = port
         return self._local_client
@@ -326,8 +328,8 @@ class LLMClient:
         prompt: str,
         images: List[Dict[str, Any]],
         model: str = "anthropic/claude-sonnet-4.6",
-        max_tokens: int = 1024,
-        reasoning_effort: str = "low",
+        max_tokens: int = 2048,
+        reasoning_effort: str = "none",
     ) -> Tuple[str, Dict[str, Any]]:
         """
         Send a vision query to an LLM. Lightweight — no tools, no loop.

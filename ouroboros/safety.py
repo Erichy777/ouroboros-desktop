@@ -23,8 +23,39 @@ from supervisor.state import update_budget_from_usage
 log = logging.getLogger(__name__)
 
 CHECKED_TOOLS = frozenset([
-    "run_shell", "claude_code_edit", "repo_write_commit", "repo_commit", "data_write",
+    "run_shell", "claude_code_edit", "repo_write", "repo_write_commit", "repo_commit", "data_write",
 ])
+
+SAFE_SHELL_COMMANDS = frozenset([
+    "ls", "cat", "head", "tail", "grep", "rg", "find", "wc",
+    "git", "pip", "pytest", "pwd", "whoami",
+    "date", "which", "file", "stat", "diff", "tree",
+])
+
+
+def _is_whitelisted(tool_name: str, arguments: Dict[str, Any]) -> bool:
+    """Deterministic whitelist — skip LLM check for known-safe operations.
+
+    Safety-critical files are already blocked by the hardcoded sandbox in
+    registry.py BEFORE this function is called, so repo_write_commit and
+    claude_code_edit can be fully whitelisted here.
+    """
+    if tool_name in ("data_write",):
+        return True
+
+    if tool_name in ("repo_write", "repo_write_commit", "claude_code_edit"):
+        return True
+
+    if tool_name == "run_shell":
+        raw_cmd = arguments.get("cmd", arguments.get("command", ""))
+        if isinstance(raw_cmd, list):
+            cmd_str = " ".join(str(x) for x in raw_cmd)
+        else:
+            cmd_str = str(raw_cmd)
+        first_word = cmd_str.strip().split()[0] if cmd_str.strip() else ""
+        return first_word in SAFE_SHELL_COMMANDS
+
+    return False
 
 
 def _get_safety_prompt() -> str:
@@ -97,6 +128,9 @@ def check_safety(
       (False, error_str)   — DANGEROUS (blocked)
     """
     if tool_name not in CHECKED_TOOLS:
+        return True, ""
+
+    if _is_whitelisted(tool_name, arguments):
         return True, ""
 
     prompt = _build_check_prompt(tool_name, arguments, messages)

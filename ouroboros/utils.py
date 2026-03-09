@@ -180,6 +180,25 @@ def estimate_tokens(text: str) -> int:
     return max(1, (len(str(text or "")) + 3) // 4)
 
 
+def is_tool_success(result: str) -> bool:
+    """Check whether a tool result indicates success (not an error).
+
+    Shared by presence loop, consciousness, and task loop for outgoing
+    reply capture.  Checks error prefixes and JSON {"ok": false} patterns.
+    """
+    _err_prefixes = ("\u26a0\ufe0f", "Error:", "[TIMEOUT", "Failed")
+    if result.startswith(_err_prefixes):
+        return False
+    if result.startswith("{"):
+        try:
+            data = json.loads(result)
+            if isinstance(data, dict) and data.get("ok") is False:
+                return False
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Subprocess
 # ---------------------------------------------------------------------------
@@ -338,3 +357,153 @@ def sanitize_tool_args_for_log(
         except Exception:
             log.debug("Tool argument sanitization failed completely", exc_info=True)
             return {"_error": "sanitization_failed"}
+
+
+async def collect_evolution_metrics(repo_dir: str, data_dir: str | None = None) -> list[dict]:
+    """Collect evolution metrics (LOC, prompt sizes, memory) for each git tag."""
+    import asyncio
+    import subprocess as sp
+
+    # --- Parse journal files from data_dir for historical interpolation ---
+    def _parse_journal(filepath: str, size_key: str) -> list[tuple[_dt.datetime, float]]:
+        """Parse a JSONL journal file into sorted (datetime, size_kb) tuples."""
+        entries: list[tuple[_dt.datetime, float]] = []
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                        ts = _dt.datetime.fromisoformat(obj["ts"])
+                        size_chars = obj.get(size_key, 0)
+                        entries.append((ts, size_chars / 1024))
+                    except (json.JSONDecodeError, KeyError, ValueError):
+                        continue
+        except FileNotFoundError:
+            pass
+        entries.sort(key=lambda x: x[0])
+        return entries
+
+    identity_journal: list[tuple[_dt.datetime, float]] = []
+    scratchpad_journal: list[tuple[_dt.datetime, float]] = []
+    if data_dir:
+        mem_path = os.path.join(data_dir, "memory")
+        identity_journal = _parse_journal(
+            os.path.join(mem_path, "identity_journal.jsonl"), "new_len"
+        )
+        scratchpad_journal = _parse_journal(
+            os.path.join(mem_path, "scratchpad_journal.jsonl"), "content_len"
+        )
+
+    def _interpolate_from_journal(
+        journal_entries: list[tuple[_dt.datetime, float]], tag_date: str,
+    ) -> float:
+        """Find the latest journal entry whose timestamp is <= tag_date."""
+        if not journal_entries or not tag_date:
+            return 0
+        try:
+            dt = _dt.datetime.fromisoformat(tag_date)
+        except ValueError:
+            return 0
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_dt.timezone.utc)
+        best = 0.0
+        for entry_dt, size_kb in journal_entries:
+            entry_dt_aware = entry_dt if entry_dt.tzinfo else entry_dt.replace(tzinfo=_dt.timezone.utc)
+            if entry_dt_aware <= dt:
+                best = size_kb
+            else:
+                break
+        return round(best, 2)
+
+    result = sp.run(
+        ["git", "tag", "-l", "--sort=creatordate",
+         "--format=%(refname:short)\t%(creatordate:iso-strict)"],
+        cwd=repo_dir, capture_output=True, text=True
+    )
+
+    tags = []
+    for line in result.stdout.strip().split(chr(10)):
+        if not line.strip():
+            continue
+        parts = line.split(chr(9))
+        tag = parts[0]
+        date = parts[1] if len(parts) > 1 else ""
+        tags.append((tag, date))
+
+    def _metrics_for_tag(tag: str, date: str) -> dict | None:
+        ls_result = sp.run(
+            ["git", "ls-tree", "-r", "--name-only", tag],
+            cwd=repo_dir, capture_output=True, text=True
+        )
+        if ls_result.returncode != 0:
+            return None
+
+        files = ls_result.stdout.strip().split(chr(10))
+
+        # Count Python LOC (all .py files)
+        python_lines = 0
+        for f in files:
+            if f.endswith(".py"):
+                show = sp.run(
+                    ["git", "show", f"{tag}:{f}"],
+                    cwd=repo_dir, capture_output=True, text=True
+                )
+                if show.returncode == 0:
+                    python_lines += len(show.stdout.splitlines())
+
+        def get_file_size_kb(filepath: str) -> float:
+            show = sp.run(
+                ["git", "show", f"{tag}:{filepath}"],
+                cwd=repo_dir, capture_output=True, text=True
+            )
+            if show.returncode == 0:
+                return round(len(show.stdout.encode("utf-8")) / 1024, 2)
+            return 0
+
+        bible_kb = get_file_size_kb("BIBLE.md")
+        system_kb = get_file_size_kb("prompts/SYSTEM.md")
+
+        # Identity and scratchpad from journal interpolation
+        identity_kb = _interpolate_from_journal(identity_journal, date)
+        scratchpad_kb = _interpolate_from_journal(scratchpad_journal, date)
+        memory_kb = round(identity_kb + scratchpad_kb, 2)
+
+        return {
+            "tag": tag,
+            "date": date,
+            "code_lines": python_lines,
+            "bible_kb": bible_kb,
+            "system_kb": system_kb,
+            "identity_kb": identity_kb,
+            "scratchpad_kb": scratchpad_kb,
+            "memory_kb": memory_kb,
+        }
+
+    loop = asyncio.get_running_loop()
+    results = await asyncio.gather(*[
+        loop.run_in_executor(None, _metrics_for_tag, tag, date)
+        for tag, date in tags
+    ])
+    points = [r for r in results if r is not None]
+
+    # Override latest tag's memory with live file sizes (same formula as historical: identity + scratchpad)
+    if data_dir and points:
+        mem_dir = os.path.join(data_dir, "memory")
+        if os.path.isdir(mem_dir):
+            def _file_kb(path: str) -> float:
+                try:
+                    return os.path.getsize(path) / 1024
+                except OSError:
+                    return 0
+
+            identity_kb = _file_kb(os.path.join(mem_dir, "identity.md"))
+            scratchpad_kb = _file_kb(os.path.join(mem_dir, "scratchpad.md"))
+
+            points[-1]["identity_kb"] = round(identity_kb, 2)
+            points[-1]["scratchpad_kb"] = round(scratchpad_kb, 2)
+            points[-1]["memory_kb"] = round(identity_kb + scratchpad_kb, 2)
+
+    return points

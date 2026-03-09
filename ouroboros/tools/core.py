@@ -35,8 +35,17 @@ def _list_dir(root: pathlib.Path, rel: str, max_entries: int = 500) -> List[str]
     return items
 
 
-def _repo_read(ctx: ToolContext, path: str) -> str:
-    return read_text(ctx.repo_path(path))
+def _repo_read(ctx: ToolContext, path: str, max_lines: int = 1050, start_line: int = 1) -> str:
+    """Read a file from the repo, optionally slicing to a line range."""
+    content = read_text(ctx.repo_path(path))
+    lines = content.splitlines(keepends=True)
+    total = len(lines)
+    start = max(1, min(start_line, total + 1))
+    end = min(start + max_lines - 1, total)
+    slice_lines = lines[start - 1:end]
+    result = "".join(slice_lines)
+    header = f"# {path} — lines {start}\u2013{end} of {total}\n"
+    return header + result
 
 
 def _repo_list(ctx: ToolContext, dir: str = ".", max_entries: int = 500) -> str:
@@ -231,7 +240,7 @@ def _summarize_dialogue(ctx: ToolContext, last_n: int = 200) -> str:
         for entry in entries:
             ts = entry.get("ts", "")
             direction = entry.get("direction", "")
-            role = "Creator" if direction == "in" else "Ouroboros"
+            role = "User" if direction == "in" else "Ouroboros"
             text = entry.get("text", "")
             dialogue_text.append(f"[{ts}] {role}: {text}")
 
@@ -330,8 +339,18 @@ def get_tools() -> List[ToolEntry]:
     return [
         ToolEntry("repo_read", {
             "name": "repo_read",
-            "description": "Read a UTF-8 text file from the local repo (relative path).",
-            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+            "description": (
+                "Read a UTF-8 text file from the local repo (relative path). "
+                "Use max_lines (default 1050) and start_line (default 1) to read large files in chunks. "
+                "The result header shows 'lines X\u2013Y of Z' so you know whether you saw the full file."
+            ),
+            "parameters": {"type": "object", "properties": {
+                "path": {"type": "string"},
+                "max_lines": {"type": "integer", "default": 1050,
+                              "description": "Maximum number of lines to return (default 1050)."},
+                "start_line": {"type": "integer", "default": 1,
+                               "description": "1-indexed line to start reading from (default 1 = beginning)."},
+            }, "required": ["path"]},
         }, _repo_read),
         ToolEntry("repo_list", {
             "name": "repo_list",

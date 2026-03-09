@@ -9,6 +9,7 @@ Starlette + uvicorn on localhost:{PORT}.
 """
 
 import asyncio
+import collections
 import json
 import logging
 import os
@@ -120,6 +121,22 @@ _supervisor_error: Optional[str] = None
 _event_loop: Optional[asyncio.AbstractEventLoop] = None
 
 
+def _setup_remote_if_configured(settings: dict) -> None:
+    """Set up GitHub remote and migrate credentials if configured."""
+    slug = settings.get("GITHUB_REPO", "")
+    token = settings.get("GITHUB_TOKEN", "")
+    if not slug or not token:
+        return
+    from supervisor.git_ops import configure_remote, migrate_remote_credentials
+    remote_ok, remote_msg = configure_remote(slug, token)
+    if not remote_ok:
+        log.warning("Remote configuration failed on startup: %s", remote_msg)
+        return
+    mig_ok, mig_msg = migrate_remote_credentials()
+    if not mig_ok:
+        log.warning("Credential migration failed on startup: %s", mig_msg)
+
+
 def _run_supervisor(settings: dict) -> None:
     """Initialize and run the supervisor loop. Called in a background thread."""
     global _supervisor_error
@@ -154,11 +171,7 @@ def _run_supervisor(settings: dict) -> None:
             branch_dev="ouroboros", branch_stable="ouroboros-stable",
         )
         ensure_repo_present()
-        _repo_slug = settings.get("GITHUB_REPO", "")
-        _gh_token = settings.get("GITHUB_TOKEN", "")
-        if _repo_slug and _gh_token:
-            from supervisor.git_ops import configure_remote
-            configure_remote(_repo_slug, _gh_token)
+        _setup_remote_if_configured(settings)
         ok, msg = safe_restart(reason="bootstrap", unsynced_policy="rescue_and_reset")
         if not ok:
             log.error("Supervisor bootstrap failed: %s", msg)
@@ -560,12 +573,23 @@ async def api_settings_post(request: Request) -> JSONResponse:
                 current[key] = body[key]
         save_settings(current)
         _apply_settings_to_env(current)
+        warnings = []
         _repo_slug = current.get("GITHUB_REPO", "")
         _gh_token = current.get("GITHUB_TOKEN", "")
         if _repo_slug and _gh_token:
-            from supervisor.git_ops import configure_remote
-            configure_remote(_repo_slug, _gh_token)
-        return JSONResponse({"status": "saved"})
+            from supervisor.git_ops import configure_remote, migrate_remote_credentials
+            remote_ok, remote_msg = configure_remote(_repo_slug, _gh_token)
+            if not remote_ok:
+                log.warning("Remote configuration failed on settings save: %s", remote_msg)
+                warnings.append(f"Remote config failed: {remote_msg}")
+            else:
+                mig_ok, mig_msg = migrate_remote_credentials()
+                if not mig_ok:
+                    log.warning("Credential migration failed: %s", mig_msg)
+        resp = {"status": "saved"}
+        if warnings:
+            resp["warnings"] = warnings
+        return JSONResponse(resp)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
@@ -652,6 +676,24 @@ async def api_git_promote(request: Request) -> JSONResponse:
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+_evo_cache: Dict[str, Any] = {}
+
+
+async def api_evolution_data(request: Request) -> JSONResponse:
+    """Collect evolution metrics for each git tag."""
+    from ouroboros.utils import collect_evolution_metrics
+    import time as _t
+
+    now = _t.time()
+    if _evo_cache.get("ts") and now - _evo_cache["ts"] < 60:
+        return JSONResponse({"points": _evo_cache["points"]})
+
+    data_dir = os.environ.get("OUROBOROS_DATA_DIR", os.path.expanduser("~/Ouroboros/data"))
+    data_points = await collect_evolution_metrics(str(REPO_DIR), data_dir=data_dir)
+    _evo_cache["ts"] = now
+    _evo_cache["points"] = data_points
+    return JSONResponse({"points": data_points})
+
 async def index_page(request: Request) -> FileResponse:
     index = REPO_DIR / "web" / "index.html"
     if index.exists():
@@ -730,73 +772,102 @@ async def api_cost_breakdown(request: Request) -> JSONResponse:
     })
 
 
-# ---------------------------------------------------------------------------
-# Local model API endpoints
-# ---------------------------------------------------------------------------
-
-async def api_local_model_start(request: Request) -> JSONResponse:
+async def api_chat_history(request: Request) -> JSONResponse:
+    """Return recent chat + progress messages merged chronologically."""
     try:
-        body = await request.json()
-        source = body.get("source", "").strip()
-        filename = body.get("filename", "").strip()
-        port = int(body.get("port", 8766))
-        n_gpu_layers = int(body.get("n_gpu_layers", -1))
-        n_ctx = int(body.get("n_ctx", 0))
-        chat_format = body.get("chat_format", "chatml-function-calling").strip()
+        limit = max(0, min(int(request.query_params.get("limit", 1000)), 2000))
+    except (ValueError, TypeError):
+        limit = 1000
 
-        if not source:
-            return JSONResponse({"error": "source is required"}, status_code=400)
+    combined: list = []
 
-        from ouroboros.local_model import get_manager
-        mgr = get_manager()
+    # Read chat.jsonl
+    chat_path = DATA_DIR / "logs" / "chat.jsonl"
+    if chat_path.exists():
+        try:
+            with chat_path.open(encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    direction = str(entry.get("direction", "")).lower()
+                    if direction == "in":
+                        role = "user"
+                    elif direction == "out":
+                        role = "assistant"
+                    else:
+                        continue
+                    combined.append({
+                        "text": str(entry.get("text", "")),
+                        "role": role,
+                        "ts": str(entry.get("ts", "")),
+                        "is_progress": False,
+                    })
+        except Exception as e:
+            log.warning("Failed to read chat history: %s", e)
 
-        if mgr.is_running:
-            return JSONResponse({"error": "Local model server is already running"}, status_code=409)
+    # Read progress.jsonl
+    progress_path = DATA_DIR / "logs" / "progress.jsonl"
+    if progress_path.exists():
+        try:
+            with progress_path.open(encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    text = str(entry.get("content", entry.get("text", "")))
+                    if not text:
+                        continue
+                    combined.append({
+                        "text": text,
+                        "role": "assistant",
+                        "ts": str(entry.get("ts", "")),
+                        "is_progress": True,
+                    })
+        except Exception as e:
+            log.warning("Failed to read progress log: %s", e)
 
-        # Download can be slow, run in thread to not block the async event loop
-        import asyncio
-        model_path = await asyncio.to_thread(mgr.download_model, source, filename)
-        
-        mgr.start_server(model_path, port=port, n_gpu_layers=n_gpu_layers, n_ctx=n_ctx, chat_format=chat_format)
-        return JSONResponse({"status": "starting", "model_path": model_path})
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+    # Sort by timestamp, take last `limit`
+    combined.sort(key=lambda m: m.get("ts", ""))
+    messages = combined[-limit:] if len(combined) > limit else combined
 
+    return JSONResponse({"messages": messages})
 
-async def api_local_model_stop(request: Request) -> JSONResponse:
-    try:
-        from ouroboros.local_model import get_manager
-        get_manager().stop_server()
-        return JSONResponse({"status": "stopped"})
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-
-async def api_local_model_status(request: Request) -> JSONResponse:
-    try:
-        from ouroboros.local_model import get_manager
-        return JSONResponse(get_manager().status_dict())
-    except Exception as e:
-        return JSONResponse({"status": "error", "error": str(e)})
-
-
-async def api_local_model_test(request: Request) -> JSONResponse:
-    try:
-        from ouroboros.local_model import get_manager
-        mgr = get_manager()
-        if not mgr.is_running:
-            return JSONResponse({"error": "Local model server is not running"}, status_code=400)
-        result = mgr.test_tool_calling()
-        return JSONResponse(result)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
-
+from ouroboros.local_model_api import (
+    api_local_model_start, api_local_model_stop,
+    api_local_model_status, api_local_model_test,
+)
 
 # ---------------------------------------------------------------------------
 # App setup
 # ---------------------------------------------------------------------------
 web_dir = REPO_DIR / "web"
 web_dir.mkdir(parents=True, exist_ok=True)
+
+class NoCacheStaticFiles:
+    """Wrap StaticFiles to add Cache-Control: no-cache headers.
+    Forces PyWebView to always revalidate, preventing stale JS/CSS."""
+    def __init__(self, **kwargs):
+        self._app = StaticFiles(**kwargs)
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            async def send_with_no_cache(message):
+                if message["type"] == "http.response.start":
+                    headers = [(k, v) for k, v in message.get("headers", []) if k.lower() != b"cache-control"]
+                    headers.append((b"cache-control", b"no-cache, must-revalidate"))
+                    message = {**message, "headers": headers}
+                await send(message)
+            await self._app(scope, receive, send_with_no_cache)
+        else:
+            await self._app(scope, receive, send)
 
 routes = [
     Route("/", endpoint=index_page),
@@ -810,12 +881,14 @@ routes = [
     Route("/api/git/rollback", endpoint=api_git_rollback, methods=["POST"]),
     Route("/api/git/promote", endpoint=api_git_promote, methods=["POST"]),
     Route("/api/cost-breakdown", endpoint=api_cost_breakdown),
+    Route("/api/evolution-data", endpoint=api_evolution_data),
+    Route("/api/chat/history", endpoint=api_chat_history),
     Route("/api/local-model/start", endpoint=api_local_model_start, methods=["POST"]),
     Route("/api/local-model/stop", endpoint=api_local_model_stop, methods=["POST"]),
     Route("/api/local-model/status", endpoint=api_local_model_status),
     Route("/api/local-model/test", endpoint=api_local_model_test, methods=["POST"]),
     WebSocketRoute("/ws", endpoint=ws_endpoint),
-    Mount("/static", app=StaticFiles(directory=str(web_dir)), name="static"),
+    Mount("/static", app=NoCacheStaticFiles(directory=str(web_dir)), name="static"),
 ]
 
 from contextlib import asynccontextmanager
@@ -905,8 +978,31 @@ if __name__ == "__main__":
         """Monitor for restart signal, then shut down uvicorn."""
         while not _restart_requested.is_set():
             time.sleep(0.5)
-        log.info("Restart requested — shutting down server.")
+        log.info("Restart requested — closing WebSocket clients and shutting down server.")
+
+        # Close all WebSocket connections so uvicorn can shut down cleanly
+        loop = _event_loop
+        if loop:
+            async def _close_all_ws():
+                with _ws_lock:
+                    clients = list(_ws_clients)
+                for ws in clients:
+                    try:
+                        await ws.close(code=1012, reason="Server restarting")
+                    except Exception:
+                        pass
+            try:
+                future = asyncio.run_coroutine_threadsafe(_close_all_ws(), loop)
+                future.result(timeout=3)
+            except Exception:
+                pass
+
         server.should_exit = True
+
+        # Safety net: if uvicorn doesn't exit within 5 seconds, force it
+        time.sleep(5)
+        log.warning("Uvicorn did not exit within 5s — forcing os._exit(%d)", RESTART_EXIT_CODE)
+        os._exit(RESTART_EXIT_CODE)
 
     threading.Thread(target=_check_restart, daemon=True).start()
 

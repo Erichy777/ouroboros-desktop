@@ -318,6 +318,31 @@ def worker_main(wid: int, in_q: Any, out_q: Any, repo_dir: str, drive_root: str)
             _log_worker_crash(wid, _drive, "handle_task", _e, _tb.format_exc())
 
 
+def _write_failure_result(task_id: str) -> None:
+    """Write a failure result file for a crashed/orphaned task (zombie prevention)."""
+    if not task_id:
+        return
+    try:
+        results_dir = DRIVE_ROOT / "task_results"
+        results_dir.mkdir(parents=True, exist_ok=True)
+        final_path = results_dir / f"{task_id}.json"
+        if final_path.exists():
+            return  # Don't overwrite — may be a successful completion from just before the crash
+        result = {
+            "task_id": task_id,
+            "status": "failed",
+            "result": "Worker process crashed (crash storm). Task was not completed.",
+            "cost_usd": 0,
+            "total_rounds": 0,
+            "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
+        tmp_path = results_dir / f"{task_id}.json.tmp"
+        tmp_path.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+        os.rename(str(tmp_path), str(final_path))
+    except Exception:
+        log.warning("Failed to write failure result for task %s", task_id, exc_info=True)
+
+
 def _log_worker_crash(wid: int, drive_root: pathlib.Path, phase: str, exc: Exception, tb: str) -> None:
     """Best-effort: write crash info to supervisor.jsonl from inside worker process."""
     import os as _os
@@ -470,6 +495,37 @@ def kill_workers(force: bool = False) -> None:
         if force:
             _kill_survivors()
         WORKERS.clear()
+        # --- Zombie prevention: write failure results before clearing ---
+        try:
+            orphaned_ids = []
+            for task_id in list(RUNNING):
+                try:
+                    _write_failure_result(task_id)
+                    orphaned_ids.append(task_id)
+                except Exception:
+                    log.warning("Failed to write failure result for running task %s", task_id, exc_info=True)
+            drained = queue.drain_all_pending()
+            drained_ids = []
+            for task in drained:
+                tid = task.get("id")
+                if tid:
+                    try:
+                        _write_failure_result(tid)
+                        drained_ids.append(tid)
+                    except Exception:
+                        log.warning("Failed to write failure result for pending task %s", tid, exc_info=True)
+            if orphaned_ids or drained_ids:
+                append_jsonl(
+                    DRIVE_ROOT / "logs" / "supervisor.jsonl",
+                    {
+                        "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                        "type": "zombie_prevention_cleanup",
+                        "orphaned_running": orphaned_ids,
+                        "drained_pending": drained_ids,
+                    },
+                )
+        except Exception:
+            log.warning("Zombie prevention cleanup failed", exc_info=True)
         RUNNING.clear()
     queue.persist_queue_snapshot(reason="kill_workers")
     if cleared_running:
@@ -568,21 +624,44 @@ def ensure_workers_healthy() -> None:
         return
     busy_crashes = 0
     dead_detections = 0
+    crashed_tasks = []
     for wid, w in list(WORKERS.items()):
         if not w.proc.is_alive():
             dead_detections += 1
             if w.busy_task_id is not None:
                 busy_crashes += 1
+            exitcode = w.proc.exitcode
+            meta = RUNNING.get(w.busy_task_id, {}) if w.busy_task_id else {}
+            task_info = meta.get("task", {}) if isinstance(meta, dict) else {}
             append_jsonl(
                 DRIVE_ROOT / "logs" / "supervisor.jsonl",
                 {
                     "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                     "type": "worker_dead_detected",
                     "worker_id": wid,
-                    "exitcode": w.proc.exitcode,
+                    "exitcode": exitcode,
                     "busy_task_id": w.busy_task_id,
+                    "task_type": task_info.get("type") if isinstance(task_info, dict) else None,
+                    "task_description": (task_info.get("description", "") or "")[:200] if isinstance(task_info, dict) else None,
+                    "uptime_sec": round(time.time() - meta["started_at"]) if isinstance(meta, dict) and meta.get("started_at") else None,
+                    "attempt": meta.get("attempt") if isinstance(meta, dict) else None,
+                    "signal": -exitcode if isinstance(exitcode, int) and exitcode < 0 else None,
                 },
             )
+            if w.busy_task_id and isinstance(meta, dict) and meta.get("task"):
+                crashed_tasks.append({"task_id": w.busy_task_id, "task_type": task_info.get("type") if isinstance(task_info, dict) else None})
+                append_jsonl(
+                    DRIVE_ROOT / "logs" / "supervisor.jsonl",
+                    {
+                        "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                        "type": "worker_crash_task_dump",
+                        "worker_id": wid,
+                        "task": meta["task"],
+                        "started_at": meta.get("started_at"),
+                        "last_heartbeat_at": meta.get("last_heartbeat_at"),
+                        "attempt": meta.get("attempt"),
+                    },
+                )
             if w.busy_task_id and w.busy_task_id in RUNNING:
                 meta = RUNNING.pop(w.busy_task_id) or {}
                 task = meta.get("task") if isinstance(meta, dict) else None
@@ -616,6 +695,7 @@ def ensure_workers_healthy() -> None:
                 "type": "crash_storm_detected",
                 "crash_count": len(CRASH_TS),
                 "worker_count": len(WORKERS),
+                "crashed_tasks": crashed_tasks,
             },
         )
         if st.get("owner_chat_id"):

@@ -75,6 +75,6 @@ def get_tools() -> List[ToolEntry]:
                 },
             },
             handler=_compact_context,
-            timeout_sec=5,
+            timeout_sec=15,
         ),
     ]

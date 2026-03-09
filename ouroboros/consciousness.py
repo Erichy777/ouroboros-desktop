@@ -32,6 +32,11 @@ from ouroboros.utils import (
     truncate_for_log, sanitize_tool_result_for_log, sanitize_tool_args_for_log,
 )
 from ouroboros.llm import LLMClient, DEFAULT_LIGHT_MODEL
+from ouroboros.memory import Memory
+from ouroboros.context import (
+    build_runtime_section, build_memory_sections,
+    build_recent_sections, build_health_invariants, safe_read,
+)
 
 log = logging.getLogger(__name__)
 
@@ -235,6 +240,8 @@ class BackgroundConsciousness:
                 content = msg.get("content") or ""
                 tool_calls = msg.get("tool_calls") or []
 
+                self._emit_progress(content)
+
                 if self._paused:
                     break
 
@@ -283,6 +290,32 @@ class BackgroundConsciousness:
                 "error": repr(e),
             })
 
+    def _emit_progress(self, content: str) -> None:
+        if not content or not content.strip():
+            return
+        chat_id = self._owner_chat_id_fn()
+        entry = {
+            "type": "send_message",
+            "chat_id": chat_id,
+            "text": f"💬 {content.strip()}",
+            "format": "markdown",
+            "ts": utc_now_iso(),
+            "task_id": "bg-consciousness",
+            "content": content.strip(),
+            "is_progress": True,
+        }
+        # 1. UI event queue (only if we have a chat_id)
+        if self._event_queue is not None and chat_id is not None:
+            try:
+                if self._paused:
+                    self._deferred_events.append(entry)
+                else:
+                    self._event_queue.put(entry)
+            except Exception:
+                log.warning("Failed to emit progress event", exc_info=True)
+        # 2. Persist to progress.jsonl
+        append_jsonl(self._drive_root / "logs" / "progress.jsonl", entry)
+
     # -------------------------------------------------------------------
     # Context building (lightweight)
     # -------------------------------------------------------------------
@@ -295,34 +328,44 @@ class BackgroundConsciousness:
         return "You are Ouroboros in background consciousness mode. Think."
 
     def _build_context(self) -> str:
+        from ouroboros.agent import Env
+        env = Env(repo_dir=self._repo_dir, drive_root=self._drive_root)
+        memory = Memory(drive_root=self._drive_root, repo_dir=self._repo_dir)
+        bg_task = {"id": "bg-consciousness", "type": "consciousness"}
+
         parts = [self._load_bg_prompt()]
 
-        # Bible (abbreviated)
-        bible_path = self._repo_dir / "BIBLE.md"
-        if bible_path.exists():
-            bible = read_text(bible_path)
-            parts.append("## BIBLE.md\n\n" + clip_text(bible, 12000))
+        # BIBLE.md — full
+        bible_md = safe_read(env.repo_path("BIBLE.md"))
+        if bible_md:
+            parts.append("## BIBLE.md\n\n" + bible_md)
 
-        # Identity
-        identity_path = self._drive_root / "memory" / "identity.md"
-        if identity_path.exists():
-            parts.append("## Identity\n\n" + clip_text(
-                read_text(identity_path), 6000))
+        # Memory sections: scratchpad, identity, dialogue summary (full size)
+        parts.extend(build_memory_sections(memory))
 
-        # Scratchpad
-        scratchpad_path = self._drive_root / "memory" / "scratchpad.md"
-        if scratchpad_path.exists():
-            parts.append("## Scratchpad\n\n" + clip_text(
-                read_text(scratchpad_path), 8000))
+        # Knowledge base index
+        kb_index_path = env.drive_path("memory/knowledge/index-full.md")
+        if kb_index_path.exists():
+            kb_index = kb_index_path.read_text(encoding="utf-8")
+            if kb_index.strip():
+                parts.append("## Knowledge base\n\n" + clip_text(kb_index, 50000))
 
-        # Dialogue summary for continuity
-        summary_path = self._drive_root / "memory" / "dialogue_summary.md"
-        if summary_path.exists():
-            summary_text = read_text(summary_path)
-            if summary_text.strip():
-                parts.append("## Dialogue Summary\n\n" + clip_text(summary_text, 4000))
+        # Drive state
+        state_json = safe_read(env.drive_path("state/state.json"), fallback="{}")
+        parts.append("## Drive state\n\n" + clip_text(state_json, 90000))
 
-        # Recent observations
+        # Runtime section (same as main agent)
+        parts.append(build_runtime_section(env, bg_task))
+
+        # Health invariants
+        health_section = build_health_invariants(env)
+        if health_section:
+            parts.append(health_section)
+
+        # Recent sections — empty task_id so we get ALL tasks' progress/tools/events
+        parts.extend(build_recent_sections(memory, env, task_id=""))
+
+        # Recent observations (consciousness-specific)
         observations = []
         while not self._observations.empty():
             try:
@@ -333,28 +376,13 @@ class BackgroundConsciousness:
             parts.append("## Recent observations\n\n" + "\n".join(
                 f"- {o}" for o in observations[-10:]))
 
-        # Runtime info + state
-        runtime_lines = [f"UTC: {utc_now_iso()}"]
-        runtime_lines.append(f"BG budget spent: ${self._bg_spent_usd:.4f}")
-        runtime_lines.append(f"Current wakeup interval: {self._next_wakeup_sec}s")
-
-        # Read state.json for budget remaining
-        try:
-            state_path = self._drive_root / "state" / "state.json"
-            if state_path.exists():
-                state_data = json.loads(read_text(state_path))
-                total_budget = float(os.environ.get("TOTAL_BUDGET", "1"))
-                spent = float(state_data.get("spent_usd", 0))
-                if total_budget > 0:
-                    remaining = max(0, total_budget - spent)
-                    runtime_lines.append(f"Budget remaining: ${remaining:.2f} / ${total_budget:.2f}")
-        except Exception as e:
-            log.debug("Failed to read state for budget info: %s", e)
-
-        # Show current model
-        runtime_lines.append(f"Current model: {self._model}")
-
-        parts.append("## Runtime\n\n" + "\n".join(runtime_lines))
+        # BG-specific runtime info
+        bg_info_lines = [
+            f"BG budget spent: ${self._bg_spent_usd:.4f}",
+            f"Current wakeup interval: {self._next_wakeup_sec}s",
+            f"Current model: {self._model}",
+        ]
+        parts.append("## Background consciousness info\n\n" + "\n".join(bg_info_lines))
 
         return "\n\n".join(parts)
 

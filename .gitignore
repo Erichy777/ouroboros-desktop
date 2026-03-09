@@ -40,3 +40,6 @@ Thumbs.db
 # Release helpers (not tracked)
 .create_release.py
 .release_notes.md
+
+# Test artifacts
+<MagicMock*

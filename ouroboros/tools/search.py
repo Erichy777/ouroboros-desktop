@@ -123,5 +123,5 @@ def get_tools() -> List[ToolEntry]:
                 "reasoning_effort": {"type": "string", "enum": ["low", "medium", "high"],
                                      "description": f"Reasoning effort (default: {DEFAULT_REASONING_EFFORT})"},
             }, "required": ["query"]},
-        }, _web_search, timeout_sec=180),
+        }, _web_search, timeout_sec=540),
     ]

@@ -1,4 +1,4 @@
-# Ouroboros v3.3.0 — Architecture & Reference
+# Ouroboros v3.24.1 — Architecture & Reference
 
 This document describes every component, page, button, API endpoint, and data flow.
 It is the single source of truth for how the system works. Keep it updated.
@@ -11,13 +11,13 @@ It is the single source of truth for how the system works. Keep it updated.
 User
   │
   ▼
-launcher.py (PyWebView)       ← macOS desktop window, immutable process manager
+launcher.py (PyWebView)       ← macOS desktop window, immutable (bundle-only, not in git)
   │
   │  spawns subprocess
   ▼
 server.py (Starlette+uvicorn) ← HTTP + WebSocket on localhost:8765
   │
-  ├── web/                     ← Static HTML/JS/CSS UI (served by Starlette)
+  ├── web/                     ← Web UI (SPA with ES modules in web/modules/)
   │
   ├── supervisor/              ← Background thread inside server.py
   │   ├── message_bus.py       ← Queue-based message bus (LocalChatBridge)
@@ -25,24 +25,29 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on localhost:8765
   │   ├── state.py             ← Persistent state (state.json) with file locking
   │   ├── queue.py             ← Task queue management (PENDING/RUNNING lists)
   │   ├── events.py            ← Event dispatcher (worker→supervisor events)
-  │   └── git_ops.py           ← Git operations (clone, checkout, rescue, rollback)
+  │   └── git_ops.py           ← Git operations (clone, checkout, rescue, rollback, push, credential helper)
   │
   └── ouroboros/               ← Agent core (runs inside worker processes)
       ├── config.py            ← SSOT: paths, settings defaults, load/save, PID lock
       ├── agent.py             ← Task orchestrator
       ├── loop.py              ← LLM tool loop (send→call tools→repeat)
+      ├── pricing.py           ← Model pricing, cost estimation, usage events
       ├── llm.py               ← OpenRouter API client
       ├── safety.py            ← Dual-layer LLM security supervisor
-      ├── consciousness.py     ← Background thinking loop
+      ├── consciousness.py     ← Background thinking loop (with progress emission)
+      ├── consolidator.py      ← Episodic memory consolidation (dialogue_summary.md)
       ├── memory.py            ← Scratchpad, identity, chat history
-      ├── context.py           ← LLM context builder
+      ├── context.py           ← LLM context builder (public API for consciousness)
+      ├── review.py            ← Code collection, complexity metrics, full-codebase review
+      ├── owner_inject.py      ← Per-task owner message mailbox (forward_to_worker)
+      ├── world_profiler.py    ← System profile generator (WORLD.md)
       ├── tools/               ← Auto-discovered tool plugins
       └── ...
 ```
 
 ### Two-process model
 
-1. **launcher.py** — immutable outer shell. Never self-modifies. Handles:
+1. **launcher.py** — immutable outer shell (lives inside the `.app` bundle, not in the git repo). Never self-modifies. Handles:
    - PID lock (single instance)
    - Bootstrap: copies workspace to `~/Ouroboros/repo/` on first run
    - Core file sync: overwrites safety-critical files on every launch
@@ -56,6 +61,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on localhost:8765
    - Starlette app with HTTP API + WebSocket
    - Runs supervisor in a background thread
    - Supervisor manages worker pool, task queue, message routing
+   - Local model lifecycle endpoints extracted to `ouroboros/local_model_api.py`
 
 ### Data layout (`~/Ouroboros/`)
 
@@ -64,8 +70,14 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on localhost:8765
 ├── repo/              ← Agent's self-modifying git repository
 │   ├── server.py      ← The running server (copied from workspace)
 │   ├── ouroboros/      ← Agent core package
+│   │   └── local_model_api.py  ← Local model API endpoints (extracted from server.py)
 │   ├── supervisor/     ← Supervisor package
 │   ├── web/            ← Web UI files
+│   │   └── modules/    ← ES module pages (chat, dashboard, logs, etc.)
+│   ├── docs/           ← Project documentation
+│   │   ├── ARCHITECTURE.md ← This document
+│   │   ├── DEVELOPMENT.md  ← Engineering handbook (naming, entity types, review protocol)
+│   │   └── CHECKLISTS.md   ← Pre-commit review checklists (single source of truth)
 │   └── prompts/        ← System prompts (SYSTEM.md, SAFETY.md, CONSCIOUSNESS.md)
 ├── data/
 │   ├── settings.json   ← User settings (API keys, models, budget)
@@ -75,13 +87,25 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on localhost:8765
 │   ├── memory/
 │   │   ├── identity.md     ← Agent's self-description (persistent)
 │   │   ├── scratchpad.md   ← Working memory (persistent)
+│   │   ├── dialogue_summary.md ← Consolidated chat history (episodic narrative)
+│   │   ├── dialogue_meta.json  ← Consolidation metadata (offsets, counts)
 │   │   ├── WORLD.md        ← System profile (generated on first run)
-│   │   └── knowledge/      ← Structured knowledge base files
+│   │   ├── knowledge/      ← Structured knowledge base files
+│   │   ├── identity_journal.jsonl    ← Identity update journal
+│   │   ├── scratchpad_journal.jsonl  ← Scratchpad update journal
+│   │   ├── knowledge_journal.jsonl   ← Knowledge write journal
+│   │   ├── registry.md              ← Source-of-truth awareness map (what data the agent has vs doesn't have)
+│   │   └── owner_mailbox/           ← Per-task owner message files
+│   ├── creator/                       ← User model (structured knowledge for context-aware interaction)
+│   │   ├── _index.md                  ← Summary loaded into LLM context
+│   │   └── *.md                       ← User-defined facet files (topics, preferences, etc.)
 │   ├── logs/
 │   │   ├── chat.jsonl      ← Chat message log
+│   │   ├── progress.jsonl  ← Progress/thinking messages (BG consciousness, tasks)
 │   │   ├── events.jsonl    ← LLM rounds, task lifecycle, errors
 │   │   ├── tools.jsonl     ← Tool call log with args/results
-│   │   └── supervisor.jsonl ← Supervisor-level events
+│   │   ├── supervisor.jsonl ← Supervisor-level events
+│   │   └── task_reflections.jsonl ← Execution reflections (process memory)
 │   └── archive/            ← Rotated logs, rescue snapshots
 └── ouroboros.pid           ← PID lock file (fcntl.flock — auto-released on crash)
 ```
@@ -124,18 +148,33 @@ corrupted by agent self-modification:
 
 ## 3. Web UI Pages & Buttons
 
-The web UI is a single-page app (`web/index.html` + `web/app.js` + `web/style.css`).
-Navigation is a left sidebar with 7 pages.
+The web UI is a single-page app (`web/index.html` + `web/style.css` + ES modules).
+`web/app.js` is the thin orchestrator (~90 lines) that imports from `web/modules/`:
+- `ws.js` — WebSocket connection manager
+- `utils.js` — shared utilities (markdown rendering, escapeHtml, matrix rain)
+- `chat.js` — chat page with message rendering
+- `dashboard.js` — dashboard with controls and polling
+- `logs.js` — log viewer with category filters
+- `evolution.js` — evolution chart (Chart.js)
+- `settings.js` — settings form with local model management
+- `costs.js` — cost breakdown tables
+- `versions.js` — version management and rollback
+- `about.js` — about page
+
+Navigation is a left sidebar with 8 pages.
 
 ### 3.1 Chat
 
 - **Status badge** (top-right): "Online" (green) / "Thinking..." (amber pulse) / "Reconnecting..." (red).
   Driven by WebSocket connection state and typing events.
 - **Message input**: textarea + send button. Shift+Enter for newline, Enter to send.
-- **Messages**: user bubbles (right, blue) and assistant bubbles (left, crimson). Assistant messages render markdown.
+- **Messages**: user bubbles (right, green-tinted) and assistant bubbles (left, crimson). Assistant messages render markdown.
+- **Timestamps**: smart relative formatting (today: "HH:MM", yesterday: "Yesterday, HH:MM", older: "Mon DD, HH:MM"). Shown on hover.
+- **Progress messages**: background consciousness thinking shown as dimmed bubbles with 💬 prefix.
 - **Typing indicator**: animated "thinking dots" bubble appears when the agent is processing.
+- **Persistence**: chat history loaded from server on page load (`/api/chat/history`), survives app restarts. Fallback to sessionStorage.
 - Messages sent via WebSocket `{type: "chat", content: text}`.
-- Responses arrive via WebSocket `{type: "chat", role: "assistant", content: text}`.
+- Responses arrive via WebSocket `{type: "chat", role: "assistant", content: text, ts: "ISO"}`.
 - Supports slash commands: `/status`, `/evolve`, `/review`, `/bg`, `/restart`, `/panic`.
 
 ### 3.2 Dashboard
@@ -193,7 +232,16 @@ Navigation is a left sidebar with 7 pages.
 - **Refresh** button reloads data from `/api/cost-breakdown`.
 - Data auto-loads when the page becomes active (MutationObserver on class).
 
-### 3.7 About
+### 3.7 Evolution
+
+- **Chart**: interactive Chart.js line graph showing code LOC, prompt sizes (BIBLE, SYSTEM),
+  identity, scratchpad, and total memory growth across all git tags.
+- **Dual Y-axes**: left axis for Lines of Code, right axis for Size (KB).
+- **Tags table**: detailed breakdown per tag with all metrics.
+- Data fetched from `/api/evolution-data` (cached 60s server-side).
+- Chart.js bundled locally (`web/chart.umd.min.js`) — no CDN dependency.
+
+### 3.8 About
 
 - Logo (large, centered)
 - "A self-creating AI agent" description
@@ -221,9 +269,11 @@ Navigation is a left sidebar with 7 pages.
 | POST | `/api/local-model/start` | Start/download local model server |
 | POST | `/api/local-model/stop` | Stop local model server |
 | GET | `/api/local-model/status` | Local model status and readiness |
+| GET | `/api/evolution-data` | Evolution metrics per git tag (LOC, prompt sizes, memory) |
+| GET | `/api/chat/history` | Merged chat + progress messages (chronological, limit param) |
 | POST | `/api/local-model/test` | Local model sanity test (chat + tool calling) |
 | WS | `/ws` | WebSocket: chat messages, commands, log streaming |
-| GET | `/static/*` | Static files from `web/` directory |
+| GET | `/static/*` | Static files from `web/` directory (NoCacheStaticFiles wrapper forces revalidation) |
 
 ### WebSocket protocol
 
@@ -274,39 +324,127 @@ Each iteration (0.5s sleep):
 1. Message arrives → `handle_chat_direct(chat_id, text, image_data)`
 2. Creates task dict `{id, type, chat_id, text}`
 3. `OuroborosAgent.handle_task(task)` →
-   a. Build context (`context.py`): system prompt + bible + identity + scratchpad + runtime info
+   a. Build context (`context.py`): system prompt + bible + identity + scratchpad + runtime info + Memory Registry digest
    b. `run_llm_loop()`: LLM call → tool execution → repeat until final text response
    c. Emit events: send_message, task_metrics, task_done
 4. Events flow back to supervisor via event queue
 
 ### Tool execution (loop.py)
 
+- Pricing/cost estimation logic extracted to `pricing.py` (model pricing table, cost estimation, API key inference, usage event emission)
+- **Per-task cost cap**: Each task has a cost ceiling (default $5, env `OUROBOROS_PER_TASK_COST_USD`). When a task exceeds this, the LLM is asked to wrap up immediately. This prevents runaway evolution tasks that previously hit $10+.
+- **`memory_tools.py`**: Provides `memory_map` (read the metacognitive registry of all data sources) and `memory_update_registry` (add/update entries). Part of the Memory Registry system (v3.16.0).
+- **`tool_discovery.py`**: Provides `list_available_tools` (discover non-core tools) and `enable_tools` (activate extra tools for the current task). Enables dynamic tool set management.
 - Core tools always available; extra tools discoverable via `list_available_tools`/`enable_tools`
 - Read-only tools can run in parallel (ThreadPoolExecutor)
 - Browser tools use thread-sticky executor (Playwright greenlet affinity)
-- All tools have hard timeout (default 120s)
-- Safety check on mutative tools (run_shell, repo_write_commit, etc.)
-- Tool results truncated to 15000 chars
+- All tools have hard timeout (default 360s, per-tool overrides for browser/search/vision)
+- Multi-layer safety: hardcoded sandbox (registry.py) → deterministic whitelist → LLM safety supervisor
+- Tool results truncated per-tool (repo_read/data_read: 80k, run_shell: 40k, default: 15k chars)
 - Context compaction kicks in after round 8 (summarizes old tool results)
 
-### Safety system (safety.py)
+### Git tools (tools/git.py + tools/review.py + supervisor/git_ops.py)
 
-Two-layer LLM security:
-1. **Layer 1 (fast)**: Light model checks if tool call is SAFE/SUSPICIOUS/DANGEROUS
-2. **Layer 2 (deep)**: If flagged, heavy model re-evaluates with "are you sure?" nudge
+- **`repo_write`** (v3.24.0): write file(s) to disk WITHOUT committing. Supports single-file
+  (`path` + `content`) and multi-file (`files` array) modes. Preferred workflow:
+  `repo_write` all files → `repo_commit` once with the full diff.
+- **`repo_commit`**: stage + unified pre-commit review + commit + tests + auto-tag + auto-push.
+  Includes `review_rebuttal` parameter for disputing reviewer feedback.
+- **`repo_write_commit`**: legacy single-file write+commit (kept for compatibility).
+  Also runs unified review before commit.
+- **Unified pre-commit review** (v3.24.0): 3 models review staged diff against
+  `docs/CHECKLISTS.md`. Critical FAILs block before commit; advisory FAILs shown
+  as warnings. Review history carried across iterations. Quorum: at least 2 of 3
+  reviewers must succeed. Deterministic preflight catches VERSION/README mismatches
+  before the expensive LLM call.
+- **`pull_from_remote`**: fast-forward only pull from origin
+- **`restore_to_head`**: discard uncommitted changes (review-exempt)
+- **`revert_commit`**: create a revert commit for a specific SHA (review-exempt)
+- **Auto-tag**: on VERSION change, creates annotated tag `v{VERSION}` after tests pass
+- **Auto-push**: best-effort push to origin after successful commit (non-fatal)
+- **Credential helper**: `git_ops.configure_remote()` stores credentials in repo-local
+  `.git/credentials`. `migrate_remote_credentials()` migrates legacy token-in-URL origins.
+  Both are wired at startup and on settings save.
 
-Hardcoded sandbox in `registry.py`: blocks destructive deletion patterns for BIBLE.md and safety.py regardless of LLM verdict.
+### Safety system (safety.py + registry.py)
+
+Multi-layer security:
+1. **Hardcoded sandbox** (registry.py): deterministic blocks on safety-critical file writes, mutative git via shell, GitHub repo/auth commands. Runs BEFORE any LLM check.
+2. **Deterministic whitelist** (safety.py): known-safe operations (read-only shell commands, repo writes already guarded by sandbox) skip LLM for speed.
+3. **LLM Layer 1 (fast)**: Light model checks remaining tool calls for SAFE/SUSPICIOUS/DANGEROUS.
+4. **LLM Layer 2 (deep)**: If flagged, heavy model re-evaluates with "are you sure?" nudge.
+5. **Post-execution revert**: After claude_code_edit, modifications to safety-critical files are automatically reverted.
 `identity.md` is intentionally mutable (self-creation) and can be rewritten radically;
 the constitutional guard is that the file itself must remain non-deletable.
 
 ### Background consciousness (consciousness.py)
 
 - Daemon thread, sleeps between wakeups (interval controlled by LLM via `set_next_wakeup`)
-- Loads: identity, scratchpad, bible, recent observations, runtime state
+- Loads full agent context: BIBLE, identity, scratchpad, knowledge base, drive state,
+  health invariants, recent chat/progress/tools/events (same context as main agent)
 - Calls LLM with lightweight introspection prompt
 - Has limited tool access (memory, messaging, scheduling, read-only)
-- Pauses when regular task is running; resumes after
+- **Progress emission**: emits 💬 progress messages to UI via event queue + persists to `progress.jsonl`
+- Pauses when regular task is running; deferred events queued and flushed on resume
 - Budget-capped (default 10% of total)
+- As of v3.16.1, CONSCIOUSNESS.md includes a concrete 7-item rotating maintenance checklist (dialogue consolidation, identity freshness, scratchpad freshness, knowledge gaps, creator model freshness, tech radar, registry sync). One item is addressed per wakeup cycle.
+
+### Episodic memory consolidation (consolidator.py)
+
+- Triggered after each task completion (non-blocking, runs in a daemon thread)
+- Reads unprocessed entries from `chat.jsonl` (offset tracked in `dialogue_meta.json`)
+- Calls lightweight LLM (Gemini Flash) to create episodic narrative summaries
+- Appends episodes to `dialogue_summary.md` with timestamps and open threads
+- **Secondary consolidation**: when `dialogue_summary.md` exceeds 90K chars,
+  oldest episodes are compressed into "era summaries" (30-40% of original)
+- Threshold: minimum 20 new messages before consolidation triggers
+- First-person narrative format ("I did...", "the user asked...", "We decided...")
+
+### Scratchpad auto-consolidation (consolidator.py)
+
+- Triggered after each task when `scratchpad.md` exceeds 30,000 chars
+- LLM extracts durable insights into knowledge base topics, compresses working memory
+- Writes knowledge files to `memory/knowledge/`, rebuilds `index-full.md`
+- Uses `fcntl` file lock to serialize concurrent calls
+- Runs in a daemon thread (same pattern as dialogue consolidation)
+
+### Execution reflection (reflection.py)
+
+- Triggered at end of task when tool calls had errors or results contained
+  blocking markers (`REVIEW_BLOCKED`, `TESTS_FAILED`, `COMMIT_BLOCKED`, etc.)
+- Light LLM produces 150-250 word reflection capturing goal, errors, root cause, lessons
+- Stored in `logs/task_reflections.jsonl`; last 20 entries loaded into dynamic context
+- Pattern register: recurring error classes tracked in `memory/knowledge/patterns.md`
+  via LLM, loaded into semi-stable context as "Known error patterns"
+- Runs synchronously (not in daemon thread) to avoid data loss on shutdown
+
+### Crash report injection (agent.py)
+
+- On startup, `_verify_system_state()` checks for `state/crash_report.json`
+- If present, logs `crash_rollback_detected` event to `events.jsonl`
+- File is NOT deleted — persists so `build_health_invariants()` surfaces
+  CRITICAL: RECENT CRASH ROLLBACK on every task until the agent investigates
+
+### Subtask trace summaries
+
+- When a subtask completes, a compact trace summary is included in the result
+- Parent tasks see tool call counts, error counts, and agent notes
+- Trace is truncated to 4000 chars; large traces show first/last 15 calls
+
+### Context building (context.py)
+
+- As of v3.16.0, the Memory Registry digest (from `memory/registry.md`) is injected into every LLM context to enable source-of-truth awareness.
+- As of v3.20.0, `patterns.md` (Pattern Register) is injected into semi-stable context, and execution reflections from `task_reflections.jsonl` are injected into dynamic context.
+- As of v3.22.0, all docs are always in static context: BIBLE.md (180k), ARCHITECTURE.md (60k), DEVELOPMENT.md (30k), README.md (10k), CHECKLISTS.md (5k).
+
+### Deep review (review.py)
+
+- As of v3.16.1, the review task includes an explicit Constitution (BIBLE.md) compliance mandate as the highest-priority review criterion.
+- Full-codebase review for 1M-context models: all text files loaded without truncation
+- Dry-run size estimation before loading (avoids OOM on huge repos)
+- Fallback to chunked previews if codebase exceeds 600K token budget
+- Security: skips sensitive files (.env, .pem, credentials.json, etc.)
+- Per-file cap: 1MB
 
 ---
 
@@ -447,7 +585,7 @@ automatically on completion or via `kill_all_tracked_subprocesses()` on panic.
 
 1. **Never delete BIBLE.md. Never physically delete `identity.md` file.**
    (`identity.md` content is intentionally mutable and may be radically rewritten.)
-2. **VERSION == pyproject.toml version == latest git tag == README version**
+2. **VERSION == pyproject.toml version == latest git tag == README version == ARCHITECTURE.md header version**
 3. **Config SSOT**: all settings defaults and paths live in `ouroboros/config.py`
 4. **Message bus SSOT**: all messaging goes through `supervisor/message_bus.py`
 5. **State locking**: `state.json` uses file locks for concurrent read-modify-write
@@ -457,3 +595,7 @@ automatically on completion or via `kill_all_tracked_subprocesses()` on panic.
 9. **Panic MUST kill everything**: all processes (workers, subprocesses, subprocess
    trees, consciousness, evolution) are killed and the application exits completely.
    No agent code may prevent or delay panic. See BIBLE.md Emergency Stop Invariant.
+10. **Architecture documentation**: `docs/ARCHITECTURE.md` must be kept in sync with
+    the codebase. Every structural change (new module, new API endpoint, new data file,
+    new UI page) must be reflected here. This is the single source of truth for how
+    the system works.

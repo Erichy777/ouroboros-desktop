@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -412,7 +413,7 @@ def sync_runtime_dependencies(reason: str) -> Tuple[bool, str]:
         cmd += ["openai>=1.0.0", "requests"]
         source = "fallback:minimal"
     try:
-        subprocess.run(cmd, cwd=str(REPO_DIR), check=True)
+        subprocess.run(cmd, cwd=str(REPO_DIR), check=True, timeout=120)
         append_jsonl(
             DRIVE_ROOT / "logs" / "supervisor.jsonl",
             {
@@ -603,18 +604,44 @@ def rollback_to_version(tag_or_sha: str, reason: str = "manual_rollback") -> Tup
 # ---------------------------------------------------------------------------
 
 def configure_remote(repo_slug: str, token: str) -> Tuple[bool, str]:
-    """Set up or update the 'origin' remote with authenticated GitHub URL."""
+    """Set up or update the 'origin' remote using credential helper.
+
+    Uses git credential helper to avoid embedding the token in the remote URL
+    (which would expose it in `git remote -v` output and log files).
+    """
     if not repo_slug or not token:
         return False, "Missing repo slug or token"
-    url = f"https://x-access-token:{token}@github.com/{repo_slug}.git"
+
+    clean_url = f"https://github.com/{repo_slug}.git"
 
     if _has_remote():
-        rc, _, err = git_capture(["git", "remote", "set-url", "origin", url])
+        rc, _, err = git_capture(["git", "remote", "set-url", "origin", clean_url])
     else:
-        rc, _, err = git_capture(["git", "remote", "add", "origin", url])
+        rc, _, err = git_capture(["git", "remote", "add", "origin", clean_url])
     if rc != 0:
         return False, f"Failed to configure remote: {err}"
+
+    _configure_credential_helper(repo_slug, token)
     return True, "ok"
+
+
+def _configure_credential_helper(repo_slug: str, token: str) -> None:
+    """Store credentials via repo-local credential helper (not global ~/.git-credentials).
+
+    Each repo gets its own credentials file at .git/credentials, so multiple
+    repos can have different tokens without conflict.
+    """
+    cred_path = REPO_DIR / ".git" / "credentials"
+    git_capture([
+        "git", "config", "--local", "credential.helper",
+        f"store --file={cred_path}",
+    ])
+    cred_line = f"https://x-access-token:{token}@github.com"
+    try:
+        cred_path.write_text(cred_line + "\n", encoding="utf-8")
+        cred_path.chmod(0o600)
+    except Exception as e:
+        log.warning("Failed to write repo credentials file: %s", e)
 
 
 def push_to_remote(branch: Optional[str] = None, push_tags: bool = True) -> Tuple[bool, str]:
@@ -635,3 +662,30 @@ def push_to_remote(branch: Optional[str] = None, push_tags: bool = True) -> Tupl
         else:
             result += " + tags"
     return True, result
+
+
+def migrate_remote_credentials() -> Tuple[bool, str]:
+    """One-shot: if origin has a token embedded in the URL, migrate to credential helper.
+
+    Safe to call repeatedly — if origin is already clean, this is a no-op.
+    Handles both formats: https://TOKEN@github.com/... and https://user:TOKEN@github.com/...
+    """
+    if not _has_remote():
+        return False, "No remote configured"
+    rc, url, _ = git_capture(["git", "remote", "get-url", "origin"])
+    if rc != 0:
+        return False, "Cannot read origin URL"
+    url = url.strip()
+    m = re.match(r"https://([^@]+)@github\.com/(.+)", url)
+    if not m:
+        return True, "Origin already clean (no embedded token)"
+    userinfo = m.group(1)
+    # Handle user:token format (e.g. x-access-token:ghp_xxx)
+    if ":" in userinfo:
+        token = userinfo.split(":", 1)[1]
+    else:
+        token = userinfo
+    slug = m.group(2).rstrip("/")
+    if slug.endswith(".git"):
+        slug = slug[:-4]
+    return configure_remote(slug, token)

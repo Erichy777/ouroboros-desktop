@@ -52,7 +52,7 @@ QUEUE_SEQ_COUNTER_REF: Dict[str, int] = {"value": 0}
 
 # Lock for all mutations to PENDING, RUNNING, WORKERS shared collections.
 # Protects against concurrent access from main loop, direct-chat threads, watchdog.
-_queue_lock = threading.Lock()
+_queue_lock = threading.RLock()
 
 
 def init_queue_refs(pending: List[Dict[str, Any]], running: Dict[str, Dict[str, Any]],
@@ -93,6 +93,17 @@ def sort_pending() -> None:
 # ---------------------------------------------------------------------------
 # Queue operations
 # ---------------------------------------------------------------------------
+
+def drain_all_pending() -> list:
+    """Remove and return all pending tasks. Used during crash storm cleanup.
+
+    Caller must already hold _queue_lock (called from kill_workers which holds it).
+    """
+    drained = list(PENDING)
+    PENDING.clear()
+    persist_queue_snapshot(reason="drain_all_pending")
+    return drained
+
 
 def enqueue_task(task: Dict[str, Any], front: bool = False) -> Dict[str, Any]:
     """Add task to PENDING queue."""
@@ -352,8 +363,26 @@ def build_evolution_task_text(cycle: int) -> str:
 
 
 def build_review_task_text(reason: str) -> str:
-    """Build review task text. Minimal trigger — LLM decides scope and depth."""
-    return f"REVIEW: {reason or 'owner request'}"
+    """Build review task text.
+
+    Includes explicit Constitution-compliance mandate so the reviewer treats
+    the Constitution as the supreme authority, not just another file in context.
+    """
+    safe_reason = (reason or "owner request").replace("\n", " ").strip()[:400]
+    return (
+        "IMPORTANT — Constitutional Compliance Check:\n"
+        "The Constitution (in your system prompt) is the supreme authority above all code, "
+        "prompts, and conventions. Every finding and recommendation in this review MUST be "
+        "verified against its principles. Specifically:\n"
+        "- Flag any code, architecture, or behavior that contradicts a constitutional principle.\n"
+        "- When recommending changes, cite which principle supports the recommendation.\n"
+        "- If a trade-off exists between principles, apply the priority order: P0 > P1 > P2 > ... > P8.\n"
+        "- Do NOT recommend anything that would violate the Constitution, even if it seems "
+        "technically beneficial.\n"
+        "Constitutional compliance is not a separate section — it must permeate every part of the review.\n\n"
+        "---\n\n"
+        f"REVIEW TASK: {safe_reason}"
+    )
 
 
 def queue_review_task(reason: str, force: bool = False) -> Optional[str]:

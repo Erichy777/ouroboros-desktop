@@ -113,14 +113,13 @@ class Memory:
             lines = []
             for e in entries:
                 dir_raw = str(e.get("direction", "")).lower()
-                direction = "→" if dir_raw in ("out", "outgoing") else "←"
                 ts = str(e.get("ts", ""))[:16]
                 raw_text = str(e.get("text", ""))
                 if dir_raw in ("out", "outgoing"):
-                    text = short(raw_text, 800)
+                    lines.append(f"→ [{ts}] {raw_text}")
                 else:
-                    text = raw_text  # never truncate creator's messages
-                lines.append(f"{direction} [{ts}] {text}")
+                    username = e.get("username") or e.get("author") or "User"
+                    lines.append(f"← [{ts}] [{username}] {raw_text}")
 
             return f"Showing {len(entries)} messages:\n\n" + "\n".join(lines)
         except Exception as e:
@@ -157,19 +156,16 @@ class Memory:
         if not entries:
             return ""
         lines = []
-        for e in entries[-100:]:
+        for e in entries[-800:]:
             dir_raw = str(e.get("direction", "")).lower()
-            direction = "→" if dir_raw in ("out", "outgoing") else "←"
             ts_full = e.get("ts", "")
             ts_hhmm = ts_full[11:16] if len(ts_full) >= 16 else ""
-            # Creator messages: no truncation (most valuable context)
-            # Outgoing messages: truncate to 800 chars
             raw_text = str(e.get("text", ""))
             if dir_raw in ("out", "outgoing"):
-                text = short(raw_text, 800)
+                lines.append(f"→ {ts_hhmm} {raw_text}")
             else:
-                text = raw_text  # never truncate creator's messages
-            lines.append(f"{direction} {ts_hhmm} {text}")
+                username = e.get("username") or e.get("author") or "User"
+                lines.append(f"← {ts_hhmm} [{username}] {raw_text}")
         return "\n".join(lines)
 
     def summarize_progress(self, entries: List[Dict[str, Any]], limit: int = 15) -> str:
@@ -200,6 +196,17 @@ class Memory:
             hint_str = ", ".join(hints) if hints else ""
             status = "✓" if ("result_preview" in e and not str(e.get("result_preview", "")).lstrip().startswith("⚠️")) else "·"
             lines.append(f"{status} {tool} {hint_str}".strip())
+
+        _REVIEW_MARKERS = ("REVIEW_BLOCKED", "TESTS_FAILED", "REVIEW_MAX_ITERATIONS", "COMMIT_BLOCKED")
+        seen_failures: set = set()
+        for e in entries[-20:]:
+            result = str(e.get("result_preview", ""))
+            if any(marker in result for marker in _REVIEW_MARKERS):
+                sig = (e.get("tool", ""), result[:80])
+                if sig not in seen_failures:
+                    seen_failures.add(sig)
+                    lines.append(f"  ⚠ REVIEW_FAIL {e.get('tool', '?')}: {short(result, 300)}")
+
         return "\n".join(lines)
 
     def summarize_events(self, entries: List[Dict[str, Any]]) -> str:

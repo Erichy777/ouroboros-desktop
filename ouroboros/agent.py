@@ -158,21 +158,20 @@ class OuroborosAgent:
             )
             dirty_files = [l.strip() for l in result.stdout.strip().split('\n') if l.strip()]
             if dirty_files:
-                # Auto-rescue: commit
                 auto_committed = False
                 try:
-                    # Only stage tracked files (not secrets/notebooks)
                     subprocess.run(["git", "add", "-u"], cwd=str(self.env.repo_dir), timeout=10, check=False)
-                    subprocess.run(
-                        ["git", "commit", "-m", "auto-rescue: uncommitted changes detected on startup"],
-                        cwd=str(self.env.repo_dir), timeout=30, check=False
-                    )
-                    # Validate branch name
                     if not re.match(r'^[a-zA-Z0-9_/-]+$', self.env.branch_dev):
                         raise ValueError(f"Invalid branch name: {self.env.branch_dev}")
-                    
-                    auto_committed = True
-                    log.warning(f"Auto-rescued {len(dirty_files)} uncommitted files on startup")
+                    commit_result = subprocess.run(
+                        ["git", "commit", "-m", "auto-rescue: uncommitted changes detected on startup"],
+                        cwd=str(self.env.repo_dir), timeout=30, capture_output=True, text=True,
+                    )
+                    if commit_result.returncode == 0 and "nothing to commit" not in (commit_result.stdout or ""):
+                        auto_committed = True
+                        log.warning(f"Auto-rescued {len(dirty_files)} uncommitted files on startup")
+                    else:
+                        log.info("Auto-rescue: nothing staged to commit (untracked files only or no changes)")
                 except Exception as e:
                     log.warning(f"Failed to auto-rescue uncommitted changes: {e}", exc_info=True)
                 return {
@@ -207,7 +206,11 @@ class OuroborosAgent:
             # Check README.md version (Bible P7: VERSION == README version)
             try:
                 readme_content = read_text(self.env.repo_path("README.md"))
-                readme_match = re.search(r'\*\*Version:\*\*\s*(\d+\.\d+\.\d+)', readme_content)
+                # Match badge format: [![Version X.Y.Z](...)] or legacy **Version:** X.Y.Z
+                readme_match = (
+                    re.search(r'version-(\d+\.\d+\.\d+)', readme_content, re.IGNORECASE)
+                    or re.search(r'\*\*Version:\*\*\s*(\d+\.\d+\.\d+)', readme_content)
+                )
                 if readme_match:
                     readme_version = readme_match.group(1)
                     result_data["readme_version"] = readme_version
@@ -216,6 +219,19 @@ class OuroborosAgent:
                         issue_count += 1
             except Exception:
                 log.debug("Failed to check README.md version", exc_info=True)
+
+            # Check ARCHITECTURE.md header version
+            try:
+                arch_content = read_text(self.env.repo_path("docs/ARCHITECTURE.md"))
+                arch_match = re.search(r'# Ouroboros v(\d+\.\d+\.\d+)', arch_content)
+                if arch_match:
+                    arch_version = arch_match.group(1)
+                    result_data["architecture_version"] = arch_version
+                    if version_file != arch_version:
+                        result_data["status"] = "warning"
+                        issue_count += 1
+            except Exception:
+                log.debug("Failed to check ARCHITECTURE.md version", exc_info=True)
 
             # Check git tags
             result = subprocess.run(
@@ -336,6 +352,22 @@ class OuroborosAgent:
         checks["model"] = {"configured": configured_model or "(not set)"}
         if not configured_model:
             issues += 1
+
+        # 6. Crash rollback detection
+        try:
+            crash_path = self.env.drive_path("state") / "crash_report.json"
+            if crash_path.exists():
+                crash_data = json.loads(crash_path.read_text(encoding="utf-8"))
+                append_jsonl(drive_logs / "events.jsonl", {
+                    "ts": utc_now_iso(),
+                    "type": "crash_rollback_detected",
+                    "crash_data": crash_data,
+                })
+                log.warning("Crash rollback detected: %s", crash_data)
+                checks["crash_rollback"] = {"detected": True}
+                issues += 1
+        except Exception:
+            log.debug("Failed to process crash report", exc_info=True)
 
         # Log verification result
         event = {
@@ -506,6 +538,57 @@ class OuroborosAgent:
     # Task result emission
     # =====================================================================
 
+    @staticmethod
+    def _build_trace_summary(llm_trace: dict) -> str:
+        """Return a compact human-readable summary of tool calls and agent notes."""
+        tool_calls = llm_trace.get("tool_calls", []) or []
+        notes = llm_trace.get("assistant_notes", []) or []
+
+        n = len(tool_calls)
+        errors = sum(1 for tc in tool_calls if isinstance(tc, dict) and tc.get("is_error"))
+
+        lines: list[str] = [f"## Tool trace ({n} calls, {errors} errors)"]
+
+        if not tool_calls:
+            lines.append("No tool calls.")
+        else:
+            def _fmt_call(idx: int, tc: dict) -> str:
+                name = tc.get("tool", "unknown")
+                args = tc.get("args", {})
+                if isinstance(args, dict):
+                    parts = []
+                    for k, v in list(args.items())[:2]:
+                        v_str = str(v)
+                        if len(v_str) > 60:
+                            v_str = v_str[:57] + "..."
+                        parts.append(f"{k}={v_str!r}")
+                    args_str = ", ".join(parts)
+                else:
+                    args_str = repr(args)
+                    if len(args_str) > 80:
+                        args_str = args_str[:77] + "..."
+                suffix = " → ERROR" if tc.get("is_error") else ""
+                return f"{idx}. {name}({args_str}){suffix}"
+
+            if n > 30:
+                shown = (
+                    [_fmt_call(i + 1, tool_calls[i]) for i in range(15)]
+                    + [f"... ({n - 30} more calls) ..."]
+                    + [_fmt_call(n - 14 + i, tool_calls[n - 15 + i]) for i in range(15)]
+                )
+            else:
+                shown = [_fmt_call(i + 1, tool_calls[i]) for i in range(n)]
+            lines.extend(shown)
+
+        if notes:
+            lines.append("\n## Agent notes")
+            lines.extend(f"- {note}" for note in notes)
+
+        summary = "\n".join(lines)
+        if len(summary) > 4000:
+            summary = summary[:3997] + "..."
+        return summary
+
     def _emit_task_results(
         self, task: Dict[str, Any], text: str,
         usage: Dict[str, Any], llm_trace: Dict[str, Any],
@@ -578,11 +661,13 @@ class OuroborosAgent:
         try:
             results_dir = pathlib.Path(self.env.drive_root) / "task_results"
             results_dir.mkdir(parents=True, exist_ok=True)
+            trace_summary = self._build_trace_summary(llm_trace)
             result_data = {
                 "task_id": task.get("id"),
                 "parent_task_id": task.get("parent_task_id"),
                 "status": "completed",
-                "result": text[:4000] if text else "",  # Truncate to avoid huge files
+                "result": text[:3500] if text else "",  # Truncate to avoid huge files
+                "trace_summary": trace_summary,
                 "cost_usd": round(float(usage.get("cost") or 0), 6),
                 "total_rounds": int(usage.get("rounds") or 0),
                 "ts": utc_now_iso(),
@@ -594,39 +679,177 @@ class OuroborosAgent:
         except Exception as e:
             log.warning("Failed to store task result: %s", e)
 
+        # --- Memory consolidation (best-effort, non-blocking) ---
+        try:
+            from ouroboros.consolidator import should_consolidate, consolidate
+            chat_path = drive_logs / "chat.jsonl"
+            summary_path = self.env.drive_path("memory") / "dialogue_summary.md"
+            meta_path = self.env.drive_path("memory") / "dialogue_meta.json"
+
+            if should_consolidate(meta_path, chat_path):
+                import threading
+                _task_id = task.get("id")
+                _identity = self.memory.load_identity()
+                _llm = self.llm
+                _logs = drive_logs
+
+                def _run_consolidation():
+                    try:
+                        usage = consolidate(
+                            chat_path=chat_path,
+                            summary_path=summary_path,
+                            meta_path=meta_path,
+                            llm_client=_llm,
+                            identity_text=_identity,
+                        )
+                        if usage:
+                            cost = usage.get("cost", 0)
+                            log.info(f"Memory consolidation completed (cost: ${cost:.4f})")
+                            append_jsonl(_logs / "events.jsonl", {
+                                "ts": utc_now_iso(),
+                                "type": "memory_consolidation",
+                                "task_id": _task_id,
+                                "cost_usd": round(cost, 6),
+                            })
+                    except Exception:
+                        log.warning("Memory consolidation failed (non-critical)", exc_info=True)
+
+                threading.Thread(target=_run_consolidation, daemon=True).start()
+        except Exception:
+            log.warning("Memory consolidation setup failed (non-critical)", exc_info=True)
+
+        # --- Scratchpad consolidation (best-effort, daemon thread) ---
+        try:
+            from ouroboros.consolidator import should_consolidate_scratchpad, consolidate_scratchpad
+            scratchpad_path = self.env.drive_path("memory") / "scratchpad.md"
+            knowledge_dir = self.env.drive_path("memory") / "knowledge"
+            if should_consolidate_scratchpad(scratchpad_path):
+                _sp_llm = self.llm
+                _sp_identity = self.memory.load_identity()
+
+                def _run_sp_consolidation():
+                    try:
+                        consolidate_scratchpad(scratchpad_path, knowledge_dir, _sp_llm, _sp_identity)
+                    except Exception:
+                        log.warning("Scratchpad consolidation failed (non-critical)", exc_info=True)
+
+                threading.Thread(target=_run_sp_consolidation, daemon=True).start()
+        except Exception:
+            log.warning("Scratchpad consolidation setup failed", exc_info=True)
+
+        # --- Execution reflection (process memory, synchronous) ---
+        try:
+            from ouroboros.reflection import (
+                should_generate_reflection, generate_reflection, append_reflection,
+            )
+            if should_generate_reflection(llm_trace):
+                trace_summary = self._build_trace_summary(llm_trace)
+                try:
+                    entry = generate_reflection(
+                        task, llm_trace, trace_summary,
+                        self.llm, usage,
+                    )
+                    append_reflection(self.env.drive_root, entry)
+                except Exception:
+                    log.warning("Execution reflection failed (non-critical)", exc_info=True)
+        except Exception:
+            log.debug("Execution reflection setup failed", exc_info=True)
+
     # =====================================================================
     # Review context builder
     # =====================================================================
 
     def _build_review_context(self) -> str:
-        """Collect code snapshot + complexity metrics for review tasks."""
+        """Collect full codebase for review tasks (1M-context models get the whole thing)."""
+        _TOKEN_LIMIT = 600_000
         try:
-            from ouroboros.review import collect_sections, compute_complexity_metrics, format_metrics
-            sections, stats = collect_sections(self.env.repo_dir, self.env.drive_root)
-            metrics = compute_complexity_metrics(sections)
+            from ouroboros.review import (
+                collect_full_codebase, collect_sections,
+                chunk_sections, compute_complexity_metrics, format_metrics,
+                _SKIP_EXT, _SKIP_FILENAMES, _MAX_FILE_BYTES,
+            )
 
-            parts = [
-                "## Code Review Context\n",
-                format_metrics(metrics),
-                f"\nFiles: {stats['files']}, chars: {stats['chars']}\n",
-                "\nUse repo_read to inspect specific files. "
-                "Use run_shell for tests. Key files below:\n",
-            ]
+            # Dry-run: estimate total bytes without reading file contents.
+            # If the estimate already exceeds the token budget, skip straight to fallback.
+            _dry_bytes = 0
+            for _root, _skip_dirs, _skip_ext_extra in [
+                (self.env.repo_dir,
+                 {"__pycache__", ".git", ".pytest_cache", ".mypy_cache",
+                  "node_modules", ".venv", ".idea", ".vscode"},
+                 frozenset()),
+                (self.env.drive_root,
+                 {"archive", "locks", "downloads", "screenshots"},
+                 {".jsonl"}),
+            ]:
+                try:
+                    _root_resolved = _root.resolve()
+                    if not _root_resolved.exists():
+                        continue
+                    for _dirpath, _dirnames, _filenames in os.walk(str(_root_resolved)):
+                        _dirnames[:] = [d for d in _dirnames if d not in _skip_dirs]
+                        for _fn in _filenames:
+                            try:
+                                _p = pathlib.Path(_dirpath) / _fn
+                                if not _p.is_file() or _p.is_symlink():
+                                    continue
+                                if _p.suffix.lower() in _SKIP_EXT:
+                                    continue
+                                if _p.suffix.lower() in _skip_ext_extra:
+                                    continue
+                                if _fn in _SKIP_FILENAMES:
+                                    continue
+                                _dry_bytes += min(_p.stat().st_size, _MAX_FILE_BYTES)
+                            except Exception:
+                                continue
+                except Exception:
+                    continue
 
-            total_chars = 0
-            max_chars = 80_000
-            files_added = 0
-            for path, content in sections:
-                if total_chars >= max_chars:
-                    parts.append(f"\n... ({len(sections) - files_added} more files, use repo_read)")
-                    break
-                preview = content[:2000] if len(content) > 2000 else content
-                file_block = f"\n### {path}\n```\n{preview}\n```\n"
-                total_chars += len(file_block)
-                parts.append(file_block)
-                files_added += 1
+            if _dry_bytes / 3.5 > _TOKEN_LIMIT:
+                # Size estimate already exceeds budget — skip to fallback without reading files
+                sections, stats = collect_sections(self.env.repo_dir, self.env.drive_root)
+                metrics = compute_complexity_metrics(sections)
+                parts = [
+                    "## Code Review Context\n"
+                    "(Fallback: codebase too large for single-context review)\n",
+                    format_metrics(metrics),
+                    f"\nFiles: {stats['files']}, chars: {stats['chars']}\n",
+                    "\nUse repo_read to inspect specific files. "
+                    "Use run_shell for tests. Key files below:\n",
+                ]
+                chunks = chunk_sections(sections)
+                parts.append(chunks[0] if chunks else "(No reviewable content found.)")
+                return "\n".join(parts)
 
-            return "\n".join(parts)
+            full_text, full_stats = collect_full_codebase(self.env.repo_dir, self.env.drive_root)
+
+            if full_stats["tokens"] <= _TOKEN_LIMIT:
+                # Full codebase fits — compute metrics from sections for the header
+                sections, _ = collect_sections(self.env.repo_dir, self.env.drive_root)
+                metrics = compute_complexity_metrics(sections)
+                parts = [
+                    "## Full Codebase for Review\n",
+                    format_metrics(metrics),
+                    f"\nFiles: {full_stats['files']}, estimated tokens: {full_stats['tokens']}\n",
+                    full_text,
+                    "\nYou have the complete codebase above. "
+                    "Identify issues, patterns, security concerns, and areas for improvement.",
+                ]
+                return "\n".join(parts)
+            else:
+                # Fallback: codebase too large — use chunked previews
+                sections, stats = collect_sections(self.env.repo_dir, self.env.drive_root)
+                metrics = compute_complexity_metrics(sections)
+                parts = [
+                    "## Code Review Context\n"
+                    "(Fallback: codebase too large for single-context review)\n",
+                    format_metrics(metrics),
+                    f"\nFiles: {stats['files']}, chars: {stats['chars']}\n",
+                    "\nUse repo_read to inspect specific files. "
+                    "Use run_shell for tests. Key files below:\n",
+                ]
+                chunks = chunk_sections(sections)
+                parts.append(chunks[0] if chunks else "(No reviewable content found.)")
+                return "\n".join(parts)
         except Exception as e:
             return f"## Code Review Context\n\n(Failed to collect: {e})\nUse repo_read and repo_list to inspect code."
 

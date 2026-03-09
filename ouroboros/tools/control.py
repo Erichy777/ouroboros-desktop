@@ -88,14 +88,24 @@ def _chat_history(ctx: ToolContext, count: int = 100, offset: int = 0, search: s
 
 def _update_scratchpad(ctx: ToolContext, content: str) -> str:
     """LLM-driven scratchpad update (Constitution P3: LLM-first)."""
+    if not content or not isinstance(content, str) or len(content.strip()) < 10:
+        return (
+            "⚠️ REJECTED: content is empty or too short "
+            f"(got {type(content).__name__}, len={len(content) if isinstance(content, str) else 'N/A'}). "
+            "Scratchpad must have meaningful content (10+ chars). "
+            "This likely means the tool call was malformed — check your arguments."
+        )
     from ouroboros.memory import Memory
     mem = Memory(drive_root=ctx.drive_root)
     mem.ensure_files()
+    old_content = mem.load_scratchpad()
     mem.save_scratchpad(content)
     mem.append_journal({
         "ts": utc_now_iso(),
         "content_preview": content[:500],
         "content_len": len(content),
+        "old_content_full": old_content,
+        "old_content_len": len(old_content),
     })
     return f"OK: scratchpad updated ({len(content)} chars)"
 
@@ -131,6 +141,13 @@ def _send_owner_message(ctx: ToolContext, text: str, reason: str = "") -> str:
 
 def _update_identity(ctx: ToolContext, content: str) -> str:
     """Update identity manifest (who you are, who you want to become)."""
+    if not content or not isinstance(content, str) or len(content.strip()) < 50:
+        return (
+            "⚠️ REJECTED: content is empty or too short "
+            f"(got {type(content).__name__}, len={len(content) if isinstance(content, str) else 'N/A'}). "
+            "Identity must be a substantial text (50+ chars). "
+            "This likely means the tool call was malformed — check your arguments."
+        )
     from ouroboros.memory import Memory
     mem = Memory(drive_root=ctx.drive_root)
     mem.ensure_files()
@@ -227,7 +244,11 @@ def _get_task_result(ctx: ToolContext, task_id: str) -> str:
     status = data.get("status", "unknown")
     result = data.get("result", "")
     cost = data.get("cost_usd", 0)
-    return f"Task {task_id} [{status}]: cost=${cost:.2f}\n\n[BEGIN_SUBTASK_OUTPUT]\n{result}\n[END_SUBTASK_OUTPUT]"
+    trace = data.get("trace_summary", "")
+    output = f"Task {task_id} [{status}]: cost=${cost:.2f}\n\n[BEGIN_SUBTASK_OUTPUT]\n{result}\n[END_SUBTASK_OUTPUT]"
+    if trace:
+        output += f"\n\n[SUBTASK_TRACE]\n{trace}\n[/SUBTASK_TRACE]"
+    return output
 
 
 def _wait_for_task(ctx: ToolContext, task_id: str) -> str:

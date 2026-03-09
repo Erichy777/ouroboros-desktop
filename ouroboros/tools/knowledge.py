@@ -4,22 +4,24 @@ Provides read/write/list operations for topic-based knowledge files
 stored in memory/knowledge/ on the local data directory. Auto-maintains an index file.
 """
 
+import json
 import logging
 import re
 from pathlib import Path
 from typing import List
 
 from ouroboros.tools.registry import ToolEntry, ToolContext
+from ouroboros.utils import utc_now_iso
 
 log = logging.getLogger(__name__)
 
 KNOWLEDGE_DIR = "memory/knowledge"
-INDEX_FILE = "_index.md"
+INDEX_FILE = "index-full.md"
 
 # --- Sanitization ---
 
 _VALID_TOPIC = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,98}[a-zA-Z0-9]$|^[a-zA-Z0-9]$')
-_RESERVED = frozenset({"_index", "con", "prn", "aux", "nul"})
+_RESERVED = frozenset({"_index", "index-full", "con", "prn", "aux", "nul"})
 
 
 def _sanitize_topic(topic: str) -> str:
@@ -237,6 +239,28 @@ def _knowledge_write(ctx: ToolContext, topic: str, content: str, mode: str = "ov
         path.write_text(content, encoding="utf-8")
 
     _update_index_entry(ctx, sanitized_topic)
+
+    # Journal for evolution tracking
+    try:
+        journal_path = ctx.drive_root / "memory" / "knowledge_journal.jsonl"
+        total_kb = 0
+        knowledge_dir = ctx.drive_root / KNOWLEDGE_DIR
+        if knowledge_dir.exists():
+            for f in knowledge_dir.iterdir():
+                if f.is_file() and f.suffix == ".md":
+                    total_kb += f.stat().st_size / 1024
+        entry = {
+            "ts": utc_now_iso(),
+            "topic": sanitized_topic,
+            "mode": mode,
+            "file_kb": path.stat().st_size / 1024,
+            "total_knowledge_kb": round(total_kb, 2),
+        }
+        with open(journal_path, "a", encoding="utf-8") as jf:
+            jf.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass  # Don't fail write on journal error
+
     return f"✅ Knowledge '{sanitized_topic}' saved ({mode})."
 
 

@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import pathlib
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from ouroboros.utils import (
@@ -56,7 +57,7 @@ def _build_user_content(task: Dict[str, Any]) -> Any:
     return parts
 
 
-def _build_runtime_section(env: Any, task: Dict[str, Any]) -> str:
+def build_runtime_section(env: Any, task: Dict[str, Any]) -> str:
     """Build the runtime context section (utc_now, repo_dir, drive_root, git_head, git_branch, task info, budget info)."""
     # --- Git context ---
     try:
@@ -68,7 +69,7 @@ def _build_runtime_section(env: Any, task: Dict[str, Any]) -> str:
     # --- Budget calculation ---
     budget_info = None
     try:
-        state_json = _safe_read(env.drive_path("state/state.json"), fallback="{}")
+        state_json = safe_read(env.drive_path("state/state.json"), fallback="{}")
         state_data = json.loads(state_json)
         spent_usd = float(state_data.get("spent_usd", 0))
         total_usd = float(os.environ.get("TOTAL_BUDGET", "1"))
@@ -93,7 +94,7 @@ def _build_runtime_section(env: Any, task: Dict[str, Any]) -> str:
     return "## Runtime context\n\n" + runtime_ctx
 
 
-def _build_memory_sections(memory: Memory) -> List[str]:
+def build_memory_sections(memory: Memory) -> List[str]:
     """Build scratchpad, identity, dialogue summary sections."""
     sections = []
 
@@ -108,17 +109,17 @@ def _build_memory_sections(memory: Memory) -> List[str]:
     if summary_path.exists():
         summary_text = read_text(summary_path)
         if summary_text.strip():
-            sections.append("## Dialogue Summary\n\n" + clip_text(summary_text, 20000))
+            sections.append("## Dialogue Summary\n\n" + clip_text(summary_text, 80000))
 
     return sections
 
 
-def _build_recent_sections(memory: Memory, env: Any, task_id: str = "") -> List[str]:
+def build_recent_sections(memory: Memory, env: Any, task_id: str = "") -> List[str]:
     """Build recent chat, recent progress, recent tools, recent events sections."""
     sections = []
 
     chat_summary = memory.summarize_chat(
-        memory.read_jsonl_tail("chat.jsonl", 200))
+        memory.read_jsonl_tail("chat.jsonl", 800))
     if chat_summary:
         sections.append("## Recent chat\n\n" + chat_summary)
 
@@ -148,10 +149,41 @@ def _build_recent_sections(memory: Memory, env: Any, task_id: str = "") -> List[
     if supervisor_summary:
         sections.append("## Supervisor\n\n" + supervisor_summary)
 
+    # -- Execution reflections (process memory) --
+    reflections_path = pathlib.Path(memory.drive_root) / "logs" / "task_reflections.jsonl"
+    if reflections_path.exists():
+        try:
+            raw_lines = reflections_path.read_text(encoding="utf-8").strip().splitlines()
+            recent_reflections = []
+            for raw_line in raw_lines[-20:]:
+                raw_line = raw_line.strip()
+                if not raw_line:
+                    continue
+                try:
+                    entry = json.loads(raw_line)
+                    ts = str(entry.get("ts", ""))[:16]
+                    ttype = entry.get("task_type", "task")
+                    rounds = entry.get("rounds", 0)
+                    cost = entry.get("cost_usd", 0)
+                    markers = ", ".join(entry.get("key_markers", []))
+                    reflection = str(entry.get("reflection", ""))[:500]
+                    recent_reflections.append(
+                        f"  [{ts}] {ttype} ({rounds}r, ${cost:.2f}) [{markers}]: {reflection}"
+                    )
+                except Exception:
+                    pass
+            if recent_reflections:
+                sections.append(
+                    "## Execution reflections (process memory)\n"
+                    + "\n".join(recent_reflections)
+                )
+        except Exception:
+            pass
+
     return sections
 
 
-def _build_health_invariants(env: Any) -> str:
+def build_health_invariants(env: Any) -> str:
     """Build health invariants section for LLM-first self-detection.
 
     Surfaces anomalies as informational text. The LLM (not code) decides
@@ -159,9 +191,11 @@ def _build_health_invariants(env: Any) -> str:
     """
     checks = []
 
-    # 1. Version sync: VERSION file vs pyproject.toml
+    # 1. Version sync: VERSION file vs pyproject.toml, README badge, ARCHITECTURE.md header
     try:
         ver_file = read_text(env.repo_path("VERSION")).strip()
+        desync_parts = []
+
         pyproject = read_text(env.repo_path("pyproject.toml"))
         pyproject_ver = ""
         for line in pyproject.splitlines():
@@ -169,7 +203,29 @@ def _build_health_invariants(env: Any) -> str:
                 pyproject_ver = line.split("=", 1)[1].strip().strip('"').strip("'")
                 break
         if ver_file and pyproject_ver and ver_file != pyproject_ver:
-            checks.append(f"CRITICAL: VERSION DESYNC — VERSION={ver_file}, pyproject.toml={pyproject_ver}")
+            desync_parts.append(f"pyproject.toml={pyproject_ver}")
+
+        try:
+            readme = read_text(env.repo_path("README.md"))
+            readme_match = (
+                re.search(r'version-(\d+\.\d+\.\d+)', readme, re.IGNORECASE)
+                or re.search(r'\*\*Version:\*\*\s*(\d+\.\d+\.\d+)', readme)
+            )
+            if readme_match and readme_match.group(1) != ver_file:
+                desync_parts.append(f"README={readme_match.group(1)}")
+        except Exception:
+            pass
+
+        try:
+            arch = read_text(env.repo_path("docs/ARCHITECTURE.md"))
+            arch_match = re.search(r'# Ouroboros v(\d+\.\d+\.\d+)', arch)
+            if arch_match and arch_match.group(1) != ver_file:
+                desync_parts.append(f"ARCHITECTURE.md={arch_match.group(1)}")
+        except Exception:
+            pass
+
+        if desync_parts:
+            checks.append(f"CRITICAL: VERSION DESYNC — VERSION={ver_file}, {', '.join(desync_parts)}")
         elif ver_file:
             checks.append(f"OK: version sync ({ver_file})")
     except Exception:
@@ -216,7 +272,68 @@ def _build_health_invariants(env: Any) -> str:
     except Exception:
         pass
 
-    # 5. Duplicate processing detection: same owner message text appearing in multiple tasks
+    # 5. Memory health: thin identity, empty/bloated scratchpad
+    try:
+        identity_content = read_text(env.drive_path("memory/identity.md"))
+        if len(identity_content.strip()) < 200:
+            checks.append(f"WARNING: THIN IDENTITY — identity.md is only {len(identity_content)} chars. Cognitive decay signal.")
+    except Exception:
+        pass
+
+    try:
+        scratchpad_content = read_text(env.drive_path("memory/scratchpad.md"))
+        sp_len = len(scratchpad_content.strip())
+        if sp_len < 50:
+            checks.append("WARNING: EMPTY SCRATCHPAD — scratchpad is nearly empty. Memory loss signal.")
+        elif sp_len > 50000:
+            checks.append(f"WARNING: BLOATED SCRATCHPAD — {sp_len} chars. Extract durable insights to knowledge base.")
+        else:
+            checks.append(f"OK: scratchpad size ({sp_len} chars)")
+    except Exception:
+        pass
+
+    # 6. Crash rollback detection
+    try:
+        crash_report = env.drive_path("state/crash_report.json")
+        if crash_report.exists():
+            crash_data = json.loads(crash_report.read_text(encoding="utf-8"))
+            checks.append(
+                f"CRITICAL: RECENT CRASH ROLLBACK — rolled back from "
+                f"{crash_data.get('rolled_back_from', '?')[:12]} to tag "
+                f"{crash_data.get('tag', '?')} at {crash_data.get('ts', '?')}"
+            )
+    except Exception:
+        pass
+
+    # 7. Prompt-runtime drift: CONSCIOUSNESS.md references vs BG whitelist
+    try:
+        from ouroboros.consciousness import BackgroundConsciousness
+        consciousness_md = safe_read(env.repo_path("prompts/CONSCIOUSNESS.md"))
+        if consciousness_md:
+            whitelist = BackgroundConsciousness._BG_TOOL_WHITELIST
+            scan_text = re.sub(r'```.*?```', '', consciousness_md, flags=re.DOTALL)
+            _TOOL_PREFIXES = (
+                "schedule_", "update_", "knowledge_", "browse_", "analyze_",
+                "web_", "send_", "repo_", "data_", "chat_", "list_", "get_",
+                "wait_", "set_", "memory_",
+            )
+            prompt_tool_refs = set()
+            for m in re.finditer(r'\b([a-z][a-z0-9]*(?:_[a-z0-9]+)+)\b', scan_text):
+                candidate = m.group(1)
+                if candidate in whitelist or any(candidate.startswith(p) for p in _TOOL_PREFIXES):
+                    prompt_tool_refs.add(candidate)
+            phantom = prompt_tool_refs - whitelist
+            if phantom:
+                checks.append(
+                    f"WARNING: PROMPT-RUNTIME DRIFT — CONSCIOUSNESS.md references "
+                    f"tools not in BG whitelist: {', '.join(sorted(phantom))}"
+                )
+            else:
+                checks.append("OK: prompt-runtime sync (no phantom tools)")
+    except Exception:
+        pass
+
+    # 8. Duplicate processing detection: same owner message text appearing in multiple tasks
     try:
         import hashlib
         msg_hash_to_tasks: Dict[str, set] = {}
@@ -277,6 +394,57 @@ def _build_health_invariants(env: Any) -> str:
     return "## Health Invariants\n\n" + "\n".join(f"- {c}" for c in checks)
 
 
+def _build_registry_digest(env: Any) -> str:
+    """Build a compact one-line-per-source digest from memory/registry.md.
+
+    Returns a markdown table capped at 3000 chars, or empty string if
+    the registry doesn't exist.
+    """
+    reg_path = env.drive_path("memory/registry.md")
+    if not reg_path.exists():
+        return ""
+    try:
+        text = reg_path.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+
+    rows: list = []
+    current_id = ""
+    fields: dict = {}
+    for line in text.split("\n"):
+        if line.startswith("### "):
+            if current_id:
+                rows.append(_registry_row(current_id, fields))
+            current_id = line[4:].strip()
+            fields = {}
+        elif current_id and line.startswith("- **"):
+            # Parse "- **Key:** value"
+            m = re.match(r'^- \*\*(\w+):\*\*\s*(.*)', line)
+            if m:
+                fields[m.group(1).lower()] = m.group(2).strip()
+    if current_id:
+        rows.append(_registry_row(current_id, fields))
+
+    if not rows:
+        return ""
+
+    header = "| source | path | updated | gaps |\n|---|---|---|---|"
+    table = header + "\n" + "\n".join(rows)
+    if len(table) > 3000:
+        table = table[:2950] + "\n| ... | (truncated) | | |"
+    return "## Memory Registry (what I know / don't know)\n\n" + table
+
+
+def _registry_row(source_id: str, fields: dict) -> str:
+    path = fields.get("path", "?")
+    updated = fields.get("updated", "?")
+    gaps = fields.get("gaps", "—")
+    # Keep gaps short
+    if len(gaps) > 60:
+        gaps = gaps[:57] + "..."
+    return f"| {source_id} | {path} | {updated} | {gaps} |"
+
+
 def build_llm_messages(
     env: Any,
     memory: Memory,
@@ -302,57 +470,90 @@ def build_llm_messages(
     task_type = str(task.get("type") or "user")
 
     # --- Read base prompts and state ---
-    base_prompt = _safe_read(
+    base_prompt = safe_read(
         env.repo_path("prompts/SYSTEM.md"),
         fallback="You are Ouroboros. Your base prompt could not be loaded."
     )
-    bible_md = _safe_read(env.repo_path("BIBLE.md"))
-    readme_md = _safe_read(env.repo_path("README.md"))
-    state_json = _safe_read(env.drive_path("state/state.json"), fallback="{}")
+    bible_md = safe_read(env.repo_path("BIBLE.md"))
+    arch_md = safe_read(env.repo_path("docs/ARCHITECTURE.md"))
+    dev_guide_md = safe_read(env.repo_path("docs/DEVELOPMENT.md"))
+    readme_md = safe_read(env.repo_path("README.md"))
+    checklists_md = safe_read(env.repo_path("docs/CHECKLISTS.md"))
+    state_json = safe_read(env.drive_path("state/state.json"), fallback="{}")
 
     # --- Load memory ---
     memory.ensure_files()
 
     # --- Assemble messages with 3-block prompt caching ---
-    # Block 1: Static content (SYSTEM.md + BIBLE.md + README) — cached
+    # Block 1: Static content (all docs) — cached
     # Block 2: Semi-stable content (identity + scratchpad + knowledge) — cached
     # Block 3: Dynamic content (state + runtime + recent logs) — uncached
-
-    # BIBLE.md always included (Constitution requires it for every decision)
-    # README.md only for evolution/review (architecture context)
-    needs_full_context = task_type in ("evolution", "review", "scheduled")
+    #
+    # All docs always included so the agent sees what reviewers judge by (Bible P5 DRY).
+    # Caps: BIBLE 180k, ARCHITECTURE 60k, DEVELOPMENT 30k, README 10k, CHECKLISTS 5k.
     static_text = (
         base_prompt + "\n\n"
         + "## BIBLE.md\n\n" + clip_text(bible_md, 180000)
     )
-    if needs_full_context:
-        static_text += "\n\n## README.md\n\n" + clip_text(readme_md, 180000)
+    if arch_md.strip():
+        static_text += "\n\n## ARCHITECTURE.md\n\n" + clip_text(arch_md, 60000)
+    if dev_guide_md.strip():
+        static_text += "\n\n## DEVELOPMENT.md\n\n" + clip_text(dev_guide_md, 30000)
+    if readme_md.strip():
+        static_text += "\n\n## README.md\n\n" + clip_text(readme_md, 10000)
+    if checklists_md.strip():
+        static_text += "\n\n## CHECKLISTS.md\n\n" + clip_text(checklists_md, 5000)
 
     # Semi-stable content: identity, scratchpad, knowledge
     # These change ~once per task, not per round
     semi_stable_parts = []
-    semi_stable_parts.extend(_build_memory_sections(memory))
+    semi_stable_parts.extend(build_memory_sections(memory))
 
-    kb_index_path = env.drive_path("memory/knowledge/_index.md")
+    kb_index_path = env.drive_path("memory/knowledge/index-full.md")
     if kb_index_path.exists():
         kb_index = kb_index_path.read_text(encoding="utf-8")
         if kb_index.strip():
             semi_stable_parts.append("## Knowledge base\n\n" + clip_text(kb_index, 50000))
+
+    # Pattern register — recurring error classes for process memory
+    patterns_path = env.drive_path("memory/knowledge/patterns.md")
+    try:
+        if patterns_path.exists():
+            patterns_text = patterns_path.read_text(encoding="utf-8")
+            if patterns_text.strip():
+                semi_stable_parts.append(
+                    "## Known error patterns (Pattern Register)\n\n"
+                    + clip_text(patterns_text, 5000)
+                )
+    except Exception:
+        pass
+
+    # Memory registry digest — compact metacognitive map
+    registry_digest = _build_registry_digest(env)
+    if registry_digest:
+        semi_stable_parts.append(registry_digest)
+
+    # Creator model — understanding of the creator for context-aware interaction
+    creator_index_path = env.drive_path("creator/_index.md")
+    if creator_index_path.exists():
+        creator_index = creator_index_path.read_text(encoding="utf-8")
+        if creator_index.strip():
+            semi_stable_parts.append("## Creator model\n\n" + clip_text(creator_index, 10000))
 
     semi_stable_text = "\n\n".join(semi_stable_parts)
 
     # Dynamic content: changes every round
     dynamic_parts = [
         "## Drive state\n\n" + clip_text(state_json, 90000),
-        _build_runtime_section(env, task),
+        build_runtime_section(env, task),
     ]
 
     # Health invariants — surfaces anomalies for LLM-first self-detection (Bible P0+P3)
-    health_section = _build_health_invariants(env)
+    health_section = build_health_invariants(env)
     if health_section:
         dynamic_parts.append(health_section)
 
-    dynamic_parts.extend(_build_recent_sections(memory, env, task_id=task.get("id", "")))
+    dynamic_parts.extend(build_recent_sections(memory, env, task_id=task.get("id", "")))
 
     if str(task.get("type") or "") == "review" and review_context_builder is not None:
         try:
@@ -427,8 +628,9 @@ def apply_message_token_soft_cap(
     if soft_cap_tokens <= 0 or estimated <= soft_cap_tokens:
         return messages, info
 
-    # Prune log summaries from the dynamic text block in multipart system messages
-    prunable = ["## Recent chat", "## Recent progress", "## Recent tools", "## Recent events", "## Supervisor"]
+    # Prune log summaries from the dynamic text block in multipart system messages.
+    # Order: least valuable first, chat history last (only removed as a last resort).
+    prunable = ["## Supervisor", "## Recent events", "## Recent tools", "## Recent progress", "## Recent chat"]
     pruned = copy.deepcopy(messages)
     for prefix in prunable:
         if estimated <= soft_cap_tokens:
@@ -445,7 +647,42 @@ def apply_message_token_soft_cap(
                         "cache_control" not in block):
                         text = block.get("text", "")
                         if prefix in text:
-                            # Remove this section from the dynamic text
+                            # For chat history, try halving before full removal
+                            if prefix == "## Recent chat":
+                                paragraphs = text.split("\n\n")
+                                # Locate the chat section paragraphs
+                                chat_start = None
+                                chat_end = len(paragraphs)
+                                for k, para in enumerate(paragraphs):
+                                    if para.startswith("## Recent chat"):
+                                        chat_start = k
+                                    elif chat_start is not None and para.startswith("##"):
+                                        chat_end = k
+                                        break
+                                if chat_start is not None:
+                                    # The first paragraph is the header; messages follow
+                                    header_para = paragraphs[chat_start]
+                                    msg_paras = paragraphs[chat_start + 1:chat_end]
+                                    half = len(msg_paras) // 2
+                                    halved_paras = (
+                                        paragraphs[:chat_start]
+                                        + [header_para]
+                                        + msg_paras[half:]
+                                        + paragraphs[chat_end:]
+                                    )
+                                    halved_text = "\n\n".join(halved_paras)
+                                    halved_tokens = estimate_tokens(halved_text) + 6
+                                    other_tokens = sum(
+                                        _estimate_message_tokens(m) for m in pruned
+                                        if m is not msg
+                                    )
+                                    if other_tokens + halved_tokens <= soft_cap_tokens:
+                                        block["text"] = halved_text
+                                        info["trimmed_sections"].append(prefix + " (halved)")
+                                        estimated = sum(_estimate_message_tokens(m) for m in pruned)
+                                        break
+
+                            # Remove this section from the dynamic text entirely
                             lines = text.split("\n\n")
                             new_lines = []
                             skip_section = False
@@ -475,17 +712,36 @@ def apply_message_token_soft_cap(
     return pruned, info
 
 
+_COMPACTION_PROTECTED_TOOLS = frozenset({
+    "repo_commit", "repo_write_commit",
+})
+
+
+def _find_tool_name_for_result(msg: dict, messages: list) -> str:
+    """Look up which tool produced a given tool-result message."""
+    target_id = msg.get("tool_call_id", "")
+    if not target_id:
+        return ""
+    msg_idx = None
+    for idx, m in enumerate(messages):
+        if m is msg:
+            msg_idx = idx
+            break
+    if msg_idx is None:
+        return ""
+    for j in range(msg_idx - 1, -1, -1):
+        prev = messages[j]
+        if prev.get("role") != "assistant":
+            continue
+        for tc in (prev.get("tool_calls") or []):
+            if tc.get("id") == target_id:
+                return tc.get("function", {}).get("name", "")
+        break
+    return ""
+
+
 def _compact_tool_result(msg: dict, content: str) -> dict:
-    """
-    Compact a single tool result message.
-
-    Args:
-        msg: Original tool result message dict
-        content: Content string to compact
-
-    Returns:
-        Compacted message dict
-    """
+    """Compact a single tool result message."""
     is_error = content.startswith("⚠️")
     # Create a short summary
     if is_error:
@@ -586,13 +842,14 @@ def compact_tool_history(messages: list, keep_recent: int = 6) -> list:
                     break
 
             if parent_round is not None and parent_round in rounds_to_compact:
-                # Compact this tool result
                 content = str(msg.get("content") or "")
+                tool_name = _find_tool_name_for_result(msg, messages)
+                if tool_name in _COMPACTION_PROTECTED_TOOLS or content.startswith("⚠️"):
+                    result.append(msg)
+                    continue
                 result.append(_compact_tool_result(msg, content))
                 continue
 
-        # For compacted assistant messages, also trim the content (progress notes)
-        # AND compact tool_call arguments
         if i in rounds_to_compact and msg.get("role") == "assistant":
             result.append(_compact_assistant_msg(msg))
             continue
@@ -619,6 +876,7 @@ def compact_tool_history_llm(messages: list, keep_recent: int = 6) -> list:
     rounds_to_compact = set(tool_round_starts[:-keep_recent])
 
     old_results = []
+    protected_indices: set = set()
     for i, msg in enumerate(messages):
         if msg.get("role") != "tool" or i == 0:
             continue
@@ -629,6 +887,10 @@ def compact_tool_history_llm(messages: list, keep_recent: int = 6) -> list:
                 break
         if parent_round is not None and parent_round in rounds_to_compact:
             content = str(msg.get("content") or "")
+            tool_name = _find_tool_name_for_result(msg, messages)
+            if tool_name in _COMPACTION_PROTECTED_TOOLS or content.startswith("⚠️"):
+                protected_indices.add(i)
+                continue
             if len(content) > 120:
                 tool_call_id = msg.get("tool_call_id", "")
                 old_results.append({"idx": i, "tool_call_id": tool_call_id, "content": content[:1500]})
@@ -693,6 +955,9 @@ def compact_tool_history_llm(messages: list, keep_recent: int = 6) -> list:
         if msg.get("role") == "system" and isinstance(msg.get("content"), list):
             result.append(msg)
             continue
+        if i in protected_indices:
+            result.append(msg)
+            continue
         if i in idx_to_summary:
             result.append({**msg, "content": idx_to_summary[i]})
             continue
@@ -704,6 +969,10 @@ def compact_tool_history_llm(messages: list, keep_recent: int = 6) -> list:
                     break
             if parent_round is not None and parent_round in rounds_to_compact:
                 content = str(msg.get("content") or "")
+                tool_name = _find_tool_name_for_result(msg, messages)
+                if tool_name in _COMPACTION_PROTECTED_TOOLS or content.startswith("⚠️"):
+                    result.append(msg)
+                    continue
                 result.append(_compact_tool_result(msg, content))
                 continue
         if i in rounds_to_compact and msg.get("role") == "assistant":
@@ -715,21 +984,13 @@ def compact_tool_history_llm(messages: list, keep_recent: int = 6) -> list:
 
 
 def _compact_tool_call_arguments(tool_name: str, args_json: str) -> Dict[str, Any]:
+    """Compact tool call arguments for old rounds.
+
+    For tools with large content payloads, replace the field with a
+    length-tagged marker.  For other tools, truncate if > 500 chars.
     """
-    Compact tool call arguments for old rounds.
-
-    For tools with large content payloads, remove the large field and add _truncated marker.
-    For other tools, truncate arguments if > 500 chars.
-
-    Args:
-        tool_name: Name of the tool
-        args_json: JSON string of tool arguments
-
-    Returns:
-        Dict with 'name' and 'arguments' (JSON string, possibly compacted)
-    """
-    # Tools with large content fields that should be stripped
     LARGE_CONTENT_TOOLS = {
+        "repo_write": "content",
         "repo_write_commit": "content",
         "data_write": "content",
         "claude_code_edit": "prompt",
@@ -739,11 +1000,11 @@ def _compact_tool_call_arguments(tool_name: str, args_json: str) -> Dict[str, An
     try:
         args = json.loads(args_json)
 
-        # Check if this tool has a large content field to remove
         if tool_name in LARGE_CONTENT_TOOLS:
             large_field = LARGE_CONTENT_TOOLS[tool_name]
             if large_field in args and args[large_field]:
-                args[large_field] = {"_truncated": True}
+                v = args[large_field] if isinstance(args[large_field], str) else json.dumps(args[large_field], ensure_ascii=False)
+                args[large_field] = f"<<CONTENT_OMITTED len={len(v)}>>"
                 return {"name": tool_name, "arguments": json.dumps(args, ensure_ascii=False)}
 
         # For other tools, if args JSON is > 500 chars, truncate
@@ -762,12 +1023,12 @@ def _compact_tool_call_arguments(tool_name: str, args_json: str) -> Dict[str, An
         return {"name": tool_name, "arguments": args_json}
 
 
-def _safe_read(path: pathlib.Path, fallback: str = "") -> str:
+def safe_read(path: pathlib.Path, fallback: str = "") -> str:
     """Read a file, returning fallback if it doesn't exist or errors."""
     try:
         if path.exists():
             return read_text(path)
     except Exception:
-        log.debug(f"Failed to read file {path} in _safe_read", exc_info=True)
+        log.debug(f"Failed to read file {path} in safe_read", exc_info=True)
         pass
     return fallback

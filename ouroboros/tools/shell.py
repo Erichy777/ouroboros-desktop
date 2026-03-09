@@ -71,6 +71,17 @@ def kill_all_tracked_subprocesses():
 
 
 # ---------------------------------------------------------------------------
+# Shell builtins / operators that cannot run via subprocess
+# ---------------------------------------------------------------------------
+_SHELL_BUILTINS = frozenset([
+    "cd", "source", ".", "export", "alias", "eval",
+    "set", "unset", "pushd", "popd", "read", "ulimit",
+])
+
+_SHELL_OPERATORS = frozenset(["&&", "||", "|", ";", ">", ">>", "<", "<<"])
+
+
+# ---------------------------------------------------------------------------
 # run_shell
 # ---------------------------------------------------------------------------
 def _run_shell(ctx: ToolContext, cmd, cwd: str = "") -> str:
@@ -116,6 +127,31 @@ def _run_shell(ctx: ToolContext, cmd, cwd: str = "") -> str:
     if not isinstance(cmd, list):
         return "⚠️ SHELL_ARG_ERROR: cmd must be a list of strings."
     cmd = [str(x) for x in cmd]
+
+    # Reject shell builtins (they are not executables)
+    if cmd and cmd[0] in _SHELL_BUILTINS:
+        if cmd[0] == "cd":
+            return (
+                '⚠️ SHELL_CMD_ERROR: "cd" is a shell builtin, not an executable. '
+                'Use the "cwd" parameter instead: '
+                'run_shell(cmd=["git", "log"], cwd="/target/dir")'
+            )
+        return (
+            f'⚠️ SHELL_CMD_ERROR: "{cmd[0]}" is a shell builtin and cannot '
+            'be executed directly via subprocess. '
+            'Use ["sh", "-c", "your command"] if you need shell builtins.'
+        )
+
+    # Reject shell operators in cmd array (subprocess doesn't interpret them)
+    found_ops = _SHELL_OPERATORS.intersection(cmd)
+    if found_ops:
+        op = sorted(found_ops)[0]
+        return (
+            f'⚠️ SHELL_CMD_ERROR: Shell operator "{op}" found in cmd array. '
+            'Subprocess does not interpret shell syntax. '
+            'Options: (1) Split into separate run_shell calls. '
+            '(2) For pipes/chaining: ["sh", "-c", "cmd1 && cmd2"]'
+        )
 
     work_dir = ctx.repo_dir
     if cwd and cwd.strip() not in ("", ".", "./"):

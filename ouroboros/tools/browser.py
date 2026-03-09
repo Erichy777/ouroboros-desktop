@@ -232,16 +232,16 @@ _MARKDOWN_JS = """() => {
 }"""
 
 
-def _extract_page_output(page: Any, output: str, ctx: ToolContext) -> str:
+def _extract_page_output(page: Any, output: str, ctx: ToolContext):
     """Extract page content in the requested format."""
     if output == "screenshot":
         data = page.screenshot(type="png", full_page=False)
         b64 = base64.b64encode(data).decode()
         ctx.browser_state.last_screenshot_b64 = b64
-        return (
-            f"Screenshot captured ({len(b64)} bytes base64). "
-            f"Call send_photo(image_base64='__last_screenshot__') to deliver it to the owner."
-        )
+        return {
+            "__image__": {"base64": b64, "mime": "image/png"},
+            "text": f"Screenshot captured ({len(b64)} bytes base64). Use analyze_screenshot to analyze it, or send_photo to deliver to owner."
+        }
     elif output == "html":
         html = page.content()
         return html[:50000] + ("... [truncated]" if len(html) > 50000 else "")
@@ -254,9 +254,15 @@ def _extract_page_output(page: Any, output: str, ctx: ToolContext) -> str:
 
 
 def _browse_page(ctx: ToolContext, url: str, output: str = "text",
-                 wait_for: str = "", timeout: int = 30000) -> str:
+                 wait_for: str = "", timeout: int = 30000,
+                 viewport_width: int = 0, viewport_height: int = 0) -> str:
     try:
         page = _ensure_browser(ctx)
+        if viewport_width > 0 or viewport_height > 0:
+            page.set_viewport_size({
+                "width": viewport_width or 1920,
+                "height": viewport_height or 1080,
+            })
         page.goto(url, timeout=timeout, wait_until="domcontentloaded")
         if wait_for:
             page.wait_for_selector(wait_for, timeout=timeout)
@@ -299,10 +305,10 @@ def _browser_action(ctx: ToolContext, action: str, selector: str = "",
             data = page.screenshot(type="png", full_page=False)
             b64 = base64.b64encode(data).decode()
             ctx.browser_state.last_screenshot_b64 = b64
-            return (
-                f"Screenshot captured ({len(b64)} bytes base64). "
-                f"Call send_photo(image_base64='__last_screenshot__') to deliver it to the owner."
-            )
+            return {
+                "__image__": {"base64": b64, "mime": "image/png"},
+                "text": f"Screenshot captured ({len(b64)} bytes base64). Use analyze_screenshot to analyze it, or send_photo to deliver to owner."
+            }
         elif action == "evaluate":
             if not value:
                 return "Error: value (JS code) required for evaluate"
@@ -366,12 +372,20 @@ def get_tools() -> List[ToolEntry]:
                             "type": "integer",
                             "description": "Page load timeout in ms (default: 30000)",
                         },
+                        "viewport_width": {
+                            "type": "integer",
+                            "description": "Viewport width in pixels (default: 1920)",
+                        },
+                        "viewport_height": {
+                            "type": "integer",
+                            "description": "Viewport height in pixels (default: 1080)",
+                        },
                     },
                     "required": ["url"],
                 },
             },
             handler=_browse_page,
-            timeout_sec=60,
+            timeout_sec=180,
         ),
         ToolEntry(
             name="browser_action",
@@ -408,6 +422,6 @@ def get_tools() -> List[ToolEntry]:
                 },
             },
             handler=_browser_action,
-            timeout_sec=60,
+            timeout_sec=180,
         ),
     ]

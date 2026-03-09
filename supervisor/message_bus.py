@@ -77,7 +77,7 @@ class LocalChatBridge:
         msg = {"type": "text", "content": clean_text, "markdown": bool(parse_mode)}
         self._outbox.put(msg)
         if self._broadcast_fn:
-            self._broadcast_fn({"type": "chat", "role": "assistant", "content": clean_text})
+            self._broadcast_fn({"type": "chat", "role": "assistant", "content": clean_text, "ts": datetime.datetime.utcnow().isoformat() + "Z"})
         return True, "ok"
 
     def send_chat_action(self, chat_id: int, action: str = "typing") -> bool:
@@ -93,11 +93,17 @@ class LocalChatBridge:
     def send_photo(self, chat_id: int, photo_bytes: bytes,
                    caption: str = "") -> Tuple[bool, str]:
         """Send photo to UI."""
-        self._outbox.put({
+        import base64
+        b64_str = base64.b64encode(photo_bytes).decode("ascii")
+        msg = {
             "type": "photo",
-            "content": photo_bytes,
-            "caption": caption
-        })
+            "image_base64": b64_str,
+            "caption": caption,
+            "ts": datetime.datetime.utcnow().isoformat() + "Z",
+        }
+        self._outbox.put(msg)
+        if self._broadcast_fn:
+            self._broadcast_fn(msg)
         return True, "ok"
 
     def download_file_base64(self, file_id: str, max_bytes: int = 10_000_000) -> Tuple[Optional[str], str]:

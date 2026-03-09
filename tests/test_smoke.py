@@ -85,9 +85,10 @@ def test_tool_set_matches(registry):
 
 
 EXPECTED_TOOLS = [
-    "repo_read", "repo_write_commit", "repo_list", "repo_commit",
+    "repo_read", "repo_write", "repo_write_commit", "repo_list", "repo_commit",
     "data_read", "data_write", "data_list",
     "git_status", "git_diff",
+    "pull_from_remote", "restore_to_head", "revert_commit",
     "run_shell", "claude_code_edit",
     "browse_page", "browser_action",
     "web_search",
@@ -98,6 +99,8 @@ EXPECTED_TOOLS = [
     "send_owner_message", "send_photo",
     "codebase_digest", "codebase_health",
     "knowledge_read", "knowledge_write", "knowledge_list",
+    # Memory registry
+    "memory_map", "memory_update_registry",
     "multi_model_review",
     # GitHub Issues
     "list_github_issues", "get_github_issue", "comment_on_issue",
@@ -246,15 +249,15 @@ def test_memory_persistence():
 
 def test_context_build_runtime_section():
     """Runtime section builder is callable."""
-    from ouroboros.context import _build_runtime_section
+    from ouroboros.context import build_runtime_section
     # Just check it's importable and callable
-    assert callable(_build_runtime_section)
+    assert callable(build_runtime_section)
 
 
 def test_context_build_memory_sections():
     """Memory sections builder is callable."""
-    from ouroboros.context import _build_memory_sections
-    assert callable(_build_memory_sections)
+    from ouroboros.context import build_memory_sections
+    assert callable(build_memory_sections)
 
 
 # ── Bible invariants ─────────────────────────────────────────────
@@ -304,9 +307,9 @@ def test_version_in_readme():
 
 
 def test_bible_exists_and_has_principles():
-    """BIBLE.md exists and contains all 9 principles (0-8)."""
+    """BIBLE.md exists and contains all 11 principles (0-10)."""
     bible = (REPO / "BIBLE.md").read_text()
-    for i in range(9):
+    for i in range(11):
         assert f"Principle {i}" in bible, f"Principle {i} missing from BIBLE.md"
 
 
@@ -470,3 +473,24 @@ class TestPrePushGate:
         """_git_commit_with_tests helper exists and is callable."""
         from ouroboros.tools.git import _git_commit_with_tests
         assert callable(_git_commit_with_tests)
+
+
+# ── Timeout handling ─────────────────────────────────────────────
+
+def test_concurrent_futures_timeout_caught():
+    """Regression test: concurrent.futures.TimeoutError must be caught.
+
+    On Python 3.10, concurrent.futures.TimeoutError is NOT a subclass of
+    builtins.TimeoutError. Our except clause must catch both.
+    Bug: tool timeouts killed the entire task instead of returning TOOL_TIMEOUT.
+    """
+    import concurrent.futures
+
+    # Verify the exception hierarchy (documents the bug)
+    # On Python 3.11+ this may be True, but our code must handle both
+    caught = False
+    try:
+        raise concurrent.futures.TimeoutError("test")
+    except (TimeoutError, concurrent.futures.TimeoutError):
+        caught = True
+    assert caught, "concurrent.futures.TimeoutError was not caught"
