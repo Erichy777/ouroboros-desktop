@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -228,6 +229,7 @@ class LLMClient:
 
         # Cap max_tokens to fit within the model's context window
         local_max = min(max_tokens, 2048)
+        ctx_len = 0
         try:
             from ouroboros.local_model import get_manager
             ctx_len = get_manager().get_context_length()
@@ -235,6 +237,9 @@ class LLMClient:
                 local_max = min(max_tokens, max(256, ctx_len // 4))
         except Exception:
             pass
+
+        if ctx_len > 0:
+            self._truncate_messages_for_context(clean_messages, ctx_len, local_max)
 
         kwargs: Dict[str, Any] = {
             "model": "local-model",
@@ -245,11 +250,24 @@ class LLMClient:
             kwargs["tools"] = clean_tools
             kwargs["tool_choice"] = tool_choice
 
-        try:
-            resp = client.chat.completions.create(**kwargs)
-        except Exception as exc:
-            log.warning("Local model request failed: %s", exc)
-            raise
+        last_exc: Optional[Exception] = None
+        for attempt in range(3):
+            try:
+                resp = client.chat.completions.create(**kwargs)
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                err = str(exc)
+                if "context_length_exceeded" in err and attempt < 2:
+                    log.warning("Context overflow (attempt %d), truncating: %s", attempt + 1, err)
+                    self._shrink_messages_from_error(clean_messages, err)
+                    continue
+                log.warning("Local model request failed: %s", exc)
+                raise
+        if last_exc is not None:
+            raise last_exc
+
         resp_dict = resp.model_dump()
         usage = resp_dict.get("usage") or {}
         choices = resp_dict.get("choices") or [{}]
@@ -257,6 +275,71 @@ class LLMClient:
 
         usage["cost"] = 0.0
         return msg, usage
+
+    @staticmethod
+    def _truncate_messages_for_context(
+        messages: List[Dict[str, Any]], ctx_len: int, max_tokens: int,
+    ) -> None:
+        """Hard-truncate message content so total fits within the context window.
+
+        Uses a conservative 3-chars-per-token ratio to avoid underestimating.
+        """
+        available_tokens = ctx_len - max_tokens - 64
+        if available_tokens < 256:
+            available_tokens = 256
+        target_chars = available_tokens * 3
+
+        total_chars = sum(len(str(m.get("content", ""))) for m in messages)
+        if total_chars <= target_chars:
+            return
+
+        for msg in messages:
+            if msg["role"] == "system" and isinstance(msg.get("content"), str):
+                content = msg["content"]
+                other_chars = total_chars - len(content)
+                allowed = max(512, target_chars - other_chars)
+                if len(content) > allowed:
+                    msg["content"] = content[:allowed] + "\n\n[Context truncated to fit model window]"
+                    log.info("Truncated system message from %d to %d chars for %d-token context",
+                             len(content), allowed, ctx_len)
+                return
+
+    @staticmethod
+    def _shrink_messages_from_error(
+        messages: List[Dict[str, Any]], error_text: str,
+    ) -> None:
+        """Parse a context_length_exceeded error and shrink the largest message."""
+        m = re.search(r"requested (\d+) tokens.*?(\d+) in the messages", error_text)
+        if not m:
+            for msg in messages:
+                if msg["role"] == "system" and isinstance(msg.get("content"), str):
+                    msg["content"] = msg["content"][:len(msg["content"]) // 2]
+                    return
+            return
+
+        requested = int(m.group(1))
+        msg_tokens = int(m.group(2))
+        # Find max context from "maximum context length is N tokens"
+        ctx_match = re.search(r"maximum context length is (\d+)", error_text)
+        ctx_max = int(ctx_match.group(1)) if ctx_match else 16384
+        comp_match = re.search(r"(\d+) in the completion", error_text)
+        comp_tokens = int(comp_match.group(1)) if comp_match else 2048
+
+        target_msg_tokens = ctx_max - comp_tokens - 64
+        if target_msg_tokens < 256:
+            target_msg_tokens = 256
+        ratio = target_msg_tokens / max(msg_tokens, 1)
+        if ratio >= 1.0:
+            ratio = 0.5
+
+        for msg in messages:
+            if msg["role"] == "system" and isinstance(msg.get("content"), str):
+                content = msg["content"]
+                new_len = max(512, int(len(content) * ratio))
+                if new_len < len(content):
+                    msg["content"] = content[:new_len] + "\n\n[Context truncated to fit model window]"
+                    log.info("Retry-truncated system message to %d chars (ratio=%.2f)", new_len, ratio)
+                return
 
     def _chat_openrouter(
         self,
